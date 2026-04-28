@@ -31,13 +31,7 @@ builds:
       - CGO_ENABLED=0
 
 archives:
-  - id: default
-    format: tarball
-    format_overrides:
-      - goos: windows
-        format: zip
-    files:
-      - trivy-template.html
+  - type: binary
 
 checksum:
   algorithm: sha256
