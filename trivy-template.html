@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   {{- if . }}
-  <title>Trivy Security Report - {{- escapeXML ( index . 0 ).Target }}</title>
+  <title>Trivy Security Report - {{ escapeXML ( index . 0 ).Target }}</title>
   <style>
     :root {
       /* Sentra Color Palette */
@@ -543,7 +543,7 @@
 
   <!-- ══ HEADER ═══════════════════════════════════════ -->
   <div class="header">
-    <div class="logo">TRIVY REPORT<span> //</span></div>
+    <div class="logo">TRIVY SCAN<span> //</span></div>
     <div class="header-right">
       Target: <strong style="color:var(--ac)">{{- escapeXML ( index . 0 ).Target }}</strong>
       &nbsp;·&nbsp;
