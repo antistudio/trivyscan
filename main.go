@@ -33,7 +33,7 @@ const (
 )
 
 type options struct {
-	Files          goflags.StringSlice
+	Input          string
 	Output         string
 	Severity       string
 	Concurrency    int
@@ -55,8 +55,7 @@ func main() {
 	flagSet.SetDescription("Scan trivy")
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringSliceVarP(&opts.Files, "input", "i", nil, "file or list file (supports: -i file1.tar -i file2.tar OR -i file1.tar,file2.tar OR -i *.tar)",
-			goflags.FileCommaSeparatedStringSliceOptions),
+		flagSet.StringVarP(&opts.Input, "input", "i", "", "input file or directory (required)"),
 	)
 
 	flagSet.CreateGroup("output", "Output",
@@ -74,14 +73,18 @@ func main() {
 		log.Fatalf("Error parsing flags: %s", err)
 	}
 
-	// Expand file patterns and validate
-	expandedFiles, err := expandFilePatterns(opts.Files)
-	if err != nil {
-		log.Fatalf("Error expanding file patterns: %s", err)
+	if opts.Input == "" {
+		log.Fatal("Input is required. Usage: -i file.tar OR -i ./directory")
 	}
 
-	if len(expandedFiles) == 0 {
-		log.Fatal("Input is required. Usage: -i file.tar OR -i file1.tar,file2.tar OR -i *.tar")
+	// Collect files from input (file or directory)
+	files, err := collectFiles(opts.Input)
+	if err != nil {
+		log.Fatalf("Error collecting files: %s", err)
+	}
+
+	if len(files) == 0 {
+		log.Fatalf("No .tar files found in: %s", opts.Input)
 	}
 
 	fmt.Println("═══════════════════════════════════════════════════════════")
@@ -112,13 +115,13 @@ func main() {
 
 	fmt.Println("───────────────────────────────────────────────────────────")
 	fmt.Printf("Starting scan with %d workers...\n", opts.Concurrency)
-	fmt.Printf("Total files to scan: %d\n", len(expandedFiles))
+	fmt.Printf("Total files to scan: %d\n", len(files))
 	fmt.Println("───────────────────────────────────────────────────────────")
 	fmt.Println()
 
 	// Run concurrent scans
 	startTime := time.Now()
-	results := scanFilesAsync(expandedFiles, opts.Output, opts.Severity, opts.Concurrency)
+	results := scanFilesAsync(files, opts.Output, opts.Severity, opts.Concurrency)
 
 	// Process results
 	var successResults []scanResult
@@ -174,7 +177,7 @@ func main() {
 	fmt.Println("═══════════════════════════════════════════════════════════")
 	fmt.Printf("Total Duration: %s\n", elapsed.Round(time.Second))
 	fmt.Printf("Success: %d | Failed: %d | Total: %d\n",
-		len(successResults), len(failResults), len(expandedFiles))
+		len(successResults), len(failResults), len(files))
 	fmt.Println("═══════════════════════════════════════════════════════════")
 
 	// Exit with error code if any scan failed
@@ -183,58 +186,42 @@ func main() {
 	}
 }
 
-// expandFilePatterns expands glob patterns and validates files exist
-func expandFilePatterns(patterns []string) ([]string, error) {
+// collectFiles collects .tar files from input (file or directory)
+func collectFiles(input string) ([]string, error) {
+	info, err := os.Stat(input)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access '%s': %w", input, err)
+	}
+
 	var files []string
-	seen := make(map[string]bool)
 
-	for _, pattern := range patterns {
-		// Check if pattern contains glob characters
-		if strings.ContainsAny(pattern, "*?[]") {
-			// Expand glob pattern
-			matches, err := filepath.Glob(pattern)
-			if err != nil {
-				return nil, fmt.Errorf("invalid pattern '%s': %w", pattern, err)
+	if info.IsDir() {
+		// Input is a directory - scan for .tar files
+		entries, err := os.ReadDir(input)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read directory '%s': %w", input, err)
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
 			}
 
-			// Add matched files
-			for _, match := range matches {
-				// Check if file exists and is regular file
-				info, err := os.Stat(match)
-				if err != nil {
-					log.Printf("⚠ Warning: Cannot access file '%s': %s", match, err)
-					continue
-				}
-				if info.IsDir() {
-					log.Printf("⚠ Warning: Skipping directory '%s'", match)
-					continue
-				}
-
-				// Add to list if not already added
-				absPath, _ := filepath.Abs(match)
-				if !seen[absPath] {
-					files = append(files, match)
-					seen[absPath] = true
-				}
-			}
-		} else {
-			// Direct file path (no glob)
-			// Check if file exists
-			info, err := os.Stat(pattern)
-			if err != nil {
-				return nil, fmt.Errorf("file '%s' does not exist: %w", pattern, err)
-			}
-			if info.IsDir() {
-				return nil, fmt.Errorf("'%s' is a directory, not a file", pattern)
-			}
-
-			// Add to list if not already added
-			absPath, _ := filepath.Abs(pattern)
-			if !seen[absPath] {
-				files = append(files, pattern)
-				seen[absPath] = true
+			// Check if file has .tar extension
+			name := entry.Name()
+			if strings.HasSuffix(strings.ToLower(name), ".tar") {
+				fullPath := filepath.Join(input, name)
+				files = append(files, fullPath)
 			}
 		}
+
+		fmt.Printf("Found %d .tar file(s) in directory: %s\n", len(files), input)
+	} else {
+		// Input is a file
+		if !strings.HasSuffix(strings.ToLower(input), ".tar") {
+			return nil, fmt.Errorf("file '%s' is not a .tar file", input)
+		}
+		files = append(files, input)
 	}
 
 	return files, nil
@@ -311,20 +298,21 @@ func calculateFileHash(filePath string) (string, error) {
 }
 
 // generateOutputFilename generates output filename with hash
-// Format: basename_hash_report.html (e.g., service_6dy3u7-report.html)
+// Format: basename_hash-report.html (e.g., service_6dy3u7-report.html)
 func generateOutputFilename(inputFile, outputDir string) (string, error) {
 	// Calculate file hash
 	fileHash, err := calculateFileHash(inputFile)
 	if err != nil {
 		// If hash fails, use timestamp as fallback
-		fileHash = fmt.Sprintf("%d", time.Now().Unix())[:hashLength]
+		timestamp := time.Now().Unix()
+		fileHash = fmt.Sprintf("%x", timestamp)[:hashLength]
 	}
 
 	// Get base filename without extension
 	baseName := filepath.Base(inputFile)
 	baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
 
-	// Generate output filename: basename_hash_report.html
+	// Generate output filename: basename_hash-report.html
 	outputFilename := fmt.Sprintf("%s_%s-report.html", baseName, fileHash)
 	outputPath := filepath.Join(outputDir, outputFilename)
 
