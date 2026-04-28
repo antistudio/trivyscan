@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/projectdiscovery/goflags"
 )
@@ -17,10 +18,12 @@ import (
 var templateContent string
 
 type options struct {
-	Files       goflags.StringSlice
-	Output      string
-	Severity    string
-	Concurrency int
+	Files          goflags.StringSlice
+	Output         string
+	Severity       string
+	Concurrency    int
+	SkipDBUpdate   bool
+	SkipTrivyCheck bool
 }
 
 type scanResult struct {
@@ -45,7 +48,9 @@ func main() {
 
 	flagSet.CreateGroup("configs", "Configs",
 		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", 3, "number of concurrent scans"),
-		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity"),
+		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels"),
+		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip trivy database update"),
+		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy installation check"),
 	)
 
 	if err := flagSet.Parse(); err != nil {
@@ -56,12 +61,28 @@ func main() {
 		log.Fatal("Input is required")
 	}
 
+	// Check trivy installation
+	if !opts.SkipTrivyCheck {
+		if err := checkTrivyInstalled(); err != nil {
+			log.Fatalf("Trivy check failed: %s", err)
+		}
+	}
+
+	// Update trivy database
+	if !opts.SkipDBUpdate {
+		if err := updateTrivyDB(); err != nil {
+			log.Printf("Warning: Failed to update trivy database: %s", err)
+			log.Println("Continuing with existing database...")
+		}
+	}
+
 	// Create output directory if not exists
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
 		log.Fatalf("Error creating output directory: %s", err)
 	}
 
 	// Run concurrent scans
+	startTime := time.Now()
 	results := scanFilesAsync(opts.Files, opts.Output, opts.Severity, opts.Concurrency)
 
 	// Process results
@@ -77,7 +98,47 @@ func main() {
 		}
 	}
 
-	fmt.Printf("\nScan completed: %d succeeded, %d failed\n", successCount, failCount)
+	elapsed := time.Since(startTime)
+	fmt.Printf("\nScan completed in %s: %d succeeded, %d failed\n", elapsed.Round(time.Second), successCount, failCount)
+}
+
+// checkTrivyInstalled verifies trivy is installed and accessible
+func checkTrivyInstalled() error {
+	fmt.Println("Checking trivy installation...")
+
+	cmd := exec.Command("trivy", "--version")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("trivy is not installed or not in PATH. Please install from: https://aquasecurity.github.io/trivy/")
+	}
+
+	version := strings.TrimSpace(string(output))
+	fmt.Printf("✓ Found trivy: %s\n", version)
+	return nil
+}
+
+// updateTrivyDB updates trivy databases (vulnerability + Java)
+func updateTrivyDB() error {
+	databases := []struct {
+		name string
+		flag string
+	}{
+		{"Vulnerability", "--download-db-only"},
+		{"Java", "--download-java-db-only"},
+	}
+
+	for _, db := range databases {
+		fmt.Printf("Updating %s database...\n", db.name)
+
+		cmd := exec.Command("trivy", "image", db.flag)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to update %s database: %w, output: %s", db.name, err, string(output))
+		}
+
+		fmt.Printf("✓ %s database updated\n", db.name)
+	}
+
+	return nil
 }
 
 // scanFilesAsync performs concurrent scanning with worker pool pattern
@@ -142,12 +203,14 @@ func scanFile(inputFile, outputDir, severity string) error {
 
 	fmt.Printf("Scanning %s...\n", inputFile)
 
+	// Prepare trivy command
 	cmd := exec.Command("trivy", "image",
 		"--input", inputFile,
 		"--severity", severity,
 		"--format", "template",
 		"--template", templateContent,
 		"--output", outputFile,
+		"--skip-db-update", // Skip DB update per scan (already updated once at start)
 	)
 
 	// Capture output for better error reporting
