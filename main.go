@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,9 @@ import (
 
 	"github.com/projectdiscovery/goflags"
 )
+
+//go:embed trivy-template.html
+var templateContent string
 
 type options struct {
 	Files       goflags.StringSlice
@@ -138,12 +142,11 @@ func scanFile(inputFile, outputDir, severity string) error {
 
 	fmt.Printf("Scanning %s...\n", inputFile)
 
-	// Prepare trivy command
 	cmd := exec.Command("trivy", "image",
 		"--input", inputFile,
 		"--severity", severity,
 		"--format", "template",
-		"--template", "@trivy-template.html",
+		"--template", templateContent,
 		"--output", outputFile,
 	)
 
