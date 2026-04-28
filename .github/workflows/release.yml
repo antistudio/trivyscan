@@ -18,11 +18,24 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.tag }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ github.ref_name }}"
+          fi
+          echo "VERSION=${VERSION#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Print version
+        run: echo "Releasing version ${{ steps.version.outputs.VERSION }}"
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
@@ -31,3 +44,4 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
