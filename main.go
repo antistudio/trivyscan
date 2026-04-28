@@ -27,8 +27,10 @@ type options struct {
 }
 
 type scanResult struct {
-	File  string
-	Error error
+	File       string
+	OutputFile string
+	Error      error
+	Duration   time.Duration
 }
 
 func main() {
@@ -61,45 +63,103 @@ func main() {
 		log.Fatal("Input is required")
 	}
 
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Println("                   TRIVY SCANNER")
+	fmt.Println("═══════════════════════════════════════════════════════════")
+
 	// Check trivy installation
 	if !opts.SkipTrivyCheck {
 		if err := checkTrivyInstalled(); err != nil {
-			log.Fatalf("Trivy check failed: %s", err)
+			log.Fatalf("✗ Trivy check failed: %s", err)
 		}
+		fmt.Println()
 	}
 
 	// Update trivy database
 	if !opts.SkipDBUpdate {
 		if err := updateTrivyDB(); err != nil {
-			log.Printf("Warning: Failed to update trivy database: %s", err)
+			log.Printf("⚠ Warning: Failed to update trivy database: %s", err)
 			log.Println("Continuing with existing database...")
 		}
+		fmt.Println()
 	}
 
 	// Create output directory if not exists
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
-		log.Fatalf("Error creating output directory: %s", err)
+		log.Fatalf("✗ Error creating output directory: %s", err)
 	}
+
+	fmt.Println("───────────────────────────────────────────────────────────")
+	fmt.Printf("Starting scan with %d workers...\n", opts.Concurrency)
+	fmt.Printf("Total files to scan: %d\n", len(opts.Files))
+	fmt.Println("───────────────────────────────────────────────────────────")
+	fmt.Println()
 
 	// Run concurrent scans
 	startTime := time.Now()
 	results := scanFilesAsync(opts.Files, opts.Output, opts.Severity, opts.Concurrency)
 
 	// Process results
-	successCount := 0
-	failCount := 0
+	var successResults []scanResult
+	var failResults []scanResult
+
 	for result := range results {
 		if result.Error != nil {
-			log.Printf("✗ Failed to scan %s: %s", result.File, result.Error)
-			failCount++
+			failResults = append(failResults, result)
 		} else {
-			fmt.Printf("✓ Successfully scanned: %s\n", result.File)
-			successCount++
+			successResults = append(successResults, result)
 		}
 	}
 
 	elapsed := time.Since(startTime)
-	fmt.Printf("\nScan completed in %s: %d succeeded, %d failed\n", elapsed.Round(time.Second), successCount, failCount)
+
+	// Print summary
+	fmt.Println()
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Println("                    SCAN SUMMARY")
+	fmt.Println("═══════════════════════════════════════════════════════════")
+
+	// Print successful scans
+	if len(successResults) > 0 {
+		fmt.Println()
+		fmt.Printf("✓ SUCCESSFUL SCANS (%d):\n", len(successResults))
+		fmt.Println("───────────────────────────────────────────────────────────")
+		for i, result := range successResults {
+			fmt.Printf("%d. Input:  %s\n", i+1, result.File)
+			fmt.Printf("   Output: %s\n", result.OutputFile)
+			fmt.Printf("   Time:   %s\n", result.Duration.Round(time.Millisecond))
+			if i < len(successResults)-1 {
+				fmt.Println()
+			}
+		}
+	}
+
+	// Print failed scans
+	if len(failResults) > 0 {
+		fmt.Println()
+		fmt.Printf("✗ FAILED SCANS (%d):\n", len(failResults))
+		fmt.Println("───────────────────────────────────────────────────────────")
+		for i, result := range failResults {
+			fmt.Printf("%d. Input: %s\n", i+1, result.File)
+			fmt.Printf("   Error: %s\n", result.Error)
+			if i < len(failResults)-1 {
+				fmt.Println()
+			}
+		}
+	}
+
+	// Print statistics
+	fmt.Println()
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Printf("Total Duration: %s\n", elapsed.Round(time.Second))
+	fmt.Printf("Success: %d | Failed: %d | Total: %d\n",
+		len(successResults), len(failResults), len(opts.Files))
+	fmt.Println("═══════════════════════════════════════════════════════════")
+
+	// Exit with error code if any scan failed
+	if len(failResults) > 0 {
+		os.Exit(1)
+	}
 }
 
 // checkTrivyInstalled verifies trivy is installed and accessible
@@ -112,8 +172,15 @@ func checkTrivyInstalled() error {
 		return fmt.Errorf("trivy is not installed or not in PATH. Please install from: https://aquasecurity.github.io/trivy/")
 	}
 
-	version := strings.TrimSpace(string(output))
-	fmt.Printf("✓ Found trivy: %s\n", version)
+	// Parse version info
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	fmt.Printf("✓ Trivy found:\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			fmt.Printf("  %s\n", strings.TrimSpace(line))
+		}
+	}
+
 	return nil
 }
 
@@ -127,15 +194,17 @@ func updateTrivyDB() error {
 		{"Java", "--download-java-db-only"},
 	}
 
+	fmt.Println("Updating trivy databases...")
 	for _, db := range databases {
-		fmt.Printf("Updating %s database...\n", db.name)
+		fmt.Printf("  • %s database... ", db.name)
 
 		cmd := exec.Command("trivy", "image", db.flag)
 		if output, err := cmd.CombinedOutput(); err != nil {
+			fmt.Println("✗ FAILED")
 			return fmt.Errorf("failed to update %s database: %w, output: %s", db.name, err, string(output))
 		}
 
-		fmt.Printf("✓ %s database updated\n", db.name)
+		fmt.Println("✓ DONE")
 	}
 
 	return nil
@@ -181,19 +250,25 @@ func worker(jobs <-chan string, results chan<- scanResult, outputDir, severity s
 
 	// Process jobs until channel is closed
 	for file := range jobs {
-		err := scanFile(file, outputDir, severity)
+		startTime := time.Now()
+		outputFile, err := scanFile(file, outputDir, severity)
+		duration := time.Since(startTime)
+
 		results <- scanResult{
-			File:  file,
-			Error: err,
+			File:       file,
+			OutputFile: outputFile,
+			Error:      err,
+			Duration:   duration,
 		}
 	}
 }
 
 // scanFile executes trivy scan for a single file
-func scanFile(inputFile, outputDir, severity string) error {
+// Returns output file path and error
+func scanFile(inputFile, outputDir, severity string) (string, error) {
 	// Check if file exists
 	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
-		return fmt.Errorf("file does not exist: %s", inputFile)
+		return "", fmt.Errorf("file does not exist: %s", inputFile)
 	}
 
 	// Generate output filename based on input filename
@@ -201,7 +276,7 @@ func scanFile(inputFile, outputDir, severity string) error {
 	baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
 	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s-report.html", baseName))
 
-	fmt.Printf("Scanning %s...\n", inputFile)
+	fmt.Printf("[SCANNING] %s\n", filepath.Base(inputFile))
 
 	// Prepare trivy command
 	cmd := exec.Command("trivy", "image",
@@ -210,14 +285,15 @@ func scanFile(inputFile, outputDir, severity string) error {
 		"--format", "template",
 		"--template", templateContent,
 		"--output", outputFile,
-		"--skip-db-update", // Skip DB update per scan (already updated once at start)
+		"--skip-db-update",      // Skip DB update per scan (already updated once at start)
+		"--skip-java-db-update", // Skip Java DB update per scan
 	)
 
 	// Capture output for better error reporting
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("trivy command failed: %w, output: %s", err, string(output))
+		return "", fmt.Errorf("trivy command failed: %w\nOutput: %s", err, string(output))
 	}
 
-	return nil
+	return outputFile, nil
 }

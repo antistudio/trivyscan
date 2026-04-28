@@ -45,11 +45,5 @@ devenv.local.yaml
 .DS_Store
 **/.DS_Store
 
-config.yaml
-**/config.yaml
-
-# signatures
-signatures/
-
-sentrax
-sentrax*
+*.tar
+*-report.html
