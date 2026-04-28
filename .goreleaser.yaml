@@ -24,14 +24,14 @@ builds:
       - v7
     ldflags:
       - -s -w
-      - -X main.version={{ if .Env.VERSION }}{{.Env.VERSION}}{{ else }}{{.Version}}{{ end }}
+      - -X main.version={{.Version}}
     flags:
       - -tags=net
     env:
       - CGO_ENABLED=0
 
-archives:
-  - type: binary
+snapshot:
+  version_template: "dev"
 
 checksum:
   algorithm: sha256
