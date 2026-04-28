@@ -15,6 +15,7 @@ import (
 type options struct {
 	Files       goflags.StringSlice
 	Output      string
+	Severity    string
 	Concurrency int
 }
 
@@ -24,7 +25,7 @@ type scanResult struct {
 }
 
 func main() {
-	opts := &options{}
+	opts := options{}
 
 	flagSet := goflags.NewFlagSet()
 	flagSet.SetDescription("Scan trivy")
@@ -36,7 +37,11 @@ func main() {
 
 	flagSet.CreateGroup("output", "Output",
 		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory (required)"),
+	)
+
+	flagSet.CreateGroup("configs", "Configs",
 		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", 3, "number of concurrent scans"),
+		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity"),
 	)
 
 	if err := flagSet.Parse(); err != nil {
@@ -53,7 +58,7 @@ func main() {
 	}
 
 	// Run concurrent scans
-	results := scanFilesAsync(opts.Files, opts.Output, opts.Concurrency)
+	results := scanFilesAsync(opts.Files, opts.Output, opts.Severity, opts.Concurrency)
 
 	// Process results
 	successCount := 0
@@ -72,7 +77,7 @@ func main() {
 }
 
 // scanFilesAsync performs concurrent scanning with worker pool pattern
-func scanFilesAsync(files []string, outputDir string, concurrency int) <-chan scanResult {
+func scanFilesAsync(files []string, outputDir, severity string, concurrency int) <-chan scanResult {
 	// Buffered channel to avoid blocking when sending results
 	results := make(chan scanResult, len(files))
 
@@ -85,7 +90,7 @@ func scanFilesAsync(files []string, outputDir string, concurrency int) <-chan sc
 	// Start worker pool
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
-		go worker(jobs, results, outputDir, &wg)
+		go worker(jobs, results, outputDir, severity, &wg)
 	}
 
 	// Send jobs to workers
@@ -106,12 +111,12 @@ func scanFilesAsync(files []string, outputDir string, concurrency int) <-chan sc
 }
 
 // worker processes scan jobs from the jobs channel
-func worker(jobs <-chan string, results chan<- scanResult, outputDir string, wg *sync.WaitGroup) {
+func worker(jobs <-chan string, results chan<- scanResult, outputDir, severity string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Process jobs until channel is closed
 	for file := range jobs {
-		err := scanFile(file, outputDir)
+		err := scanFile(file, outputDir, severity)
 		results <- scanResult{
 			File:  file,
 			Error: err,
@@ -120,7 +125,7 @@ func worker(jobs <-chan string, results chan<- scanResult, outputDir string, wg 
 }
 
 // scanFile executes trivy scan for a single file
-func scanFile(inputFile, outputDir string) error {
+func scanFile(inputFile, outputDir, severity string) error {
 	// Check if file exists
 	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
 		return fmt.Errorf("file does not exist: %s", inputFile)
@@ -136,7 +141,7 @@ func scanFile(inputFile, outputDir string) error {
 	// Prepare trivy command
 	cmd := exec.Command("trivy", "image",
 		"--input", inputFile,
-		"--severity", "MEDIUM,HIGH,CRITICAL",
+		"--severity", severity,
 		"--format", "template",
 		"--template", "@trivy-template.html",
 		"--output", outputFile,
