@@ -17,6 +17,11 @@ import (
 	"github.com/projectdiscovery/goflags"
 )
 
+var (
+	// version is set via ldflags at build time
+	version = "dev"
+)
+
 //go:embed trivy-template.html
 var templateContent string
 
@@ -39,6 +44,7 @@ type options struct {
 	Concurrency    int
 	SkipDBUpdate   bool
 	SkipTrivyCheck bool
+	Version        bool
 }
 
 type scanResult struct {
@@ -69,8 +75,18 @@ func main() {
 		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy installation check"),
 	)
 
+	flagSet.CreateGroup("info", "Info",
+		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version information"),
+	)
+
 	if err := flagSet.Parse(); err != nil {
 		log.Fatalf("Error parsing flags: %s", err)
+	}
+
+	// Handle version flag
+	if opts.Version {
+		fmt.Printf("TrivyScan version %s\n", version)
+		os.Exit(0)
 	}
 
 	if opts.Input == "" {

@@ -1,0 +1,87 @@
+# .goreleaser.yaml
+# GoReleaser configuration for TrivyScan
+# https://goreleaser.com/cookbooks/using goreleaser/
+
+project_name: trivyscan
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: trivyscan
+    main: ./main.go
+    binary: trivyscan
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    goarm:
+      - v7
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+    flags:
+      - -tags=net
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: default
+    format: tarball
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - trivy-template.html
+    # Rewrites for different platforms
+    rewrites:
+      linux: trivyscan
+      darwin: trivyscan
+      windows: trivyscan.exe
+
+checksum:
+  - algorithm: sha256
+
+snapcraft:
+  - summary: High-performance container image vulnerability scanner
+    description: |
+      TrivyScan is a high-performance, concurrent container image 
+      vulnerability scanner with professional HTML reports.
+    base: core22
+    confinement: classic
+    platforms:
+      - amd64
+      - arm64
+
+release:
+  github:
+    owner: anhnmt
+    name: trivyscan
+  # Optional: footer and template
+  # footer: |
+  #   ## SHA256 Checksums
+  #   {{ range .Artifacts }}
+  #   - {{ . }}: {{ checksum . }}
+  #   {{ end }}
+
+# Brew tap for macOS/Linux package managers (optional)
+# brews:
+#   - id: trivyscan-homebrew
+#     tap: homebrew/core
+#     commit authors:
+#       - anhnmt
+
+# CocoaPods (optional)
+# cocoapods:
+#   - id: trivyscan-cocoapods
+#     repo: anhnmt/trivyscan
+#     homepage: https://github.com/anhnmt/trivyscan
+
+#ko:
+#  - id: trivyscan
+#    repo: ghcr.io/anhnmt/trivyscan
+#    # registry config if needed
