@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -16,6 +19,18 @@ import (
 
 //go:embed trivy-template.html
 var templateContent string
+
+const (
+	trivyCmd            = "trivy"
+	trivySubCmd         = "image"
+	trivyDownloadDB     = "--download-db-only"
+	trivyDownloadJavaDB = "--download-java-db-only"
+	trivySkipDB         = "--skip-db-update"
+	trivySkipJavaDB     = "--skip-java-db-update"
+	trivyInstallURL     = "https://aquasecurity.github.io/trivy/"
+
+	hashLength = 6
+)
 
 type options struct {
 	Files          goflags.StringSlice
@@ -166,10 +181,10 @@ func main() {
 func checkTrivyInstalled() error {
 	fmt.Println("Checking trivy installation...")
 
-	cmd := exec.Command("trivy", "--version")
+	cmd := exec.Command(trivyCmd, "--version")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("trivy is not installed or not in PATH. Please install from: https://aquasecurity.github.io/trivy/")
+		return fmt.Errorf("trivy is not installed or not in PATH. Please install from: %s", trivyInstallURL)
 	}
 
 	// Parse version info
@@ -190,15 +205,15 @@ func updateTrivyDB() error {
 		name string
 		flag string
 	}{
-		{"Vulnerability", "--download-db-only"},
-		{"Java", "--download-java-db-only"},
+		{"Vulnerability", trivyDownloadDB},
+		{"Java", trivyDownloadJavaDB},
 	}
 
 	fmt.Println("Updating trivy databases...")
 	for _, db := range databases {
 		fmt.Printf("  • %s database... ", db.name)
 
-		cmd := exec.Command("trivy", "image", db.flag)
+		cmd := exec.Command(trivyCmd, trivySubCmd, db.flag)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			fmt.Println("✗ FAILED")
 			return fmt.Errorf("failed to update %s database: %w, output: %s", db.name, err, string(output))
@@ -208,6 +223,49 @@ func updateTrivyDB() error {
 	}
 
 	return nil
+}
+
+// calculateFileHash calculates SHA256 hash of a file and returns first N characters
+func calculateFileHash(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("failed to calculate hash: %w", err)
+	}
+
+	fullHash := hex.EncodeToString(hash.Sum(nil))
+
+	// Return first N characters of hash
+	if len(fullHash) < hashLength {
+		return fullHash, nil
+	}
+	return fullHash[:hashLength], nil
+}
+
+// generateOutputFilename generates output filename with hash
+// Format: basename_hash_report.html (e.g., service_6dy3u7-report.html)
+func generateOutputFilename(inputFile, outputDir string) (string, error) {
+	// Calculate file hash
+	fileHash, err := calculateFileHash(inputFile)
+	if err != nil {
+		// If hash fails, use timestamp as fallback
+		fileHash = fmt.Sprintf("%d", time.Now().Unix())[:hashLength]
+	}
+
+	// Get base filename without extension
+	baseName := filepath.Base(inputFile)
+	baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
+
+	// Generate output filename: basename_hash_report.html
+	outputFilename := fmt.Sprintf("%s_%s-report.html", baseName, fileHash)
+	outputPath := filepath.Join(outputDir, outputFilename)
+
+	return outputPath, nil
 }
 
 // scanFilesAsync performs concurrent scanning with worker pool pattern
@@ -271,22 +329,23 @@ func scanFile(inputFile, outputDir, severity string) (string, error) {
 		return "", fmt.Errorf("file does not exist: %s", inputFile)
 	}
 
-	// Generate output filename based on input filename
-	baseName := filepath.Base(inputFile)
-	baseName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
-	outputFile := filepath.Join(outputDir, fmt.Sprintf("%s-report.html", baseName))
+	// Generate output filename with hash
+	outputFile, err := generateOutputFilename(inputFile, outputDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate output filename: %w", err)
+	}
 
 	fmt.Printf("[SCANNING] %s\n", filepath.Base(inputFile))
 
 	// Prepare trivy command
-	cmd := exec.Command("trivy", "image",
+	cmd := exec.Command(trivyCmd, trivySubCmd,
 		"--input", inputFile,
 		"--severity", severity,
 		"--format", "template",
 		"--template", templateContent,
 		"--output", outputFile,
-		"--skip-db-update",      // Skip DB update per scan (already updated once at start)
-		"--skip-java-db-update", // Skip Java DB update per scan
+		trivySkipDB,     // Skip DB update per scan (already updated once at start)
+		trivySkipJavaDB, // Skip Java DB update per scan
 	)
 
 	// Capture output for better error reporting
