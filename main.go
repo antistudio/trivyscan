@@ -55,12 +55,12 @@ func main() {
 	flagSet.SetDescription("Scan trivy")
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringSliceVarP(&opts.Files, "input", "i", nil, "file or list file",
-			goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringSliceVarP(&opts.Files, "input", "i", nil, "file or list file (supports: -i file1.tar -i file2.tar OR -i file1.tar,file2.tar OR -i *.tar)",
+			goflags.FileCommaSeparatedStringSliceOptions),
 	)
 
 	flagSet.CreateGroup("output", "Output",
-		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory (required)"),
+		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory"),
 	)
 
 	flagSet.CreateGroup("configs", "Configs",
@@ -74,8 +74,14 @@ func main() {
 		log.Fatalf("Error parsing flags: %s", err)
 	}
 
-	if len(opts.Files) == 0 {
-		log.Fatal("Input is required")
+	// Expand file patterns and validate
+	expandedFiles, err := expandFilePatterns(opts.Files)
+	if err != nil {
+		log.Fatalf("Error expanding file patterns: %s", err)
+	}
+
+	if len(expandedFiles) == 0 {
+		log.Fatal("Input is required. Usage: -i file.tar OR -i file1.tar,file2.tar OR -i *.tar")
 	}
 
 	fmt.Println("═══════════════════════════════════════════════════════════")
@@ -106,13 +112,13 @@ func main() {
 
 	fmt.Println("───────────────────────────────────────────────────────────")
 	fmt.Printf("Starting scan with %d workers...\n", opts.Concurrency)
-	fmt.Printf("Total files to scan: %d\n", len(opts.Files))
+	fmt.Printf("Total files to scan: %d\n", len(expandedFiles))
 	fmt.Println("───────────────────────────────────────────────────────────")
 	fmt.Println()
 
 	// Run concurrent scans
 	startTime := time.Now()
-	results := scanFilesAsync(opts.Files, opts.Output, opts.Severity, opts.Concurrency)
+	results := scanFilesAsync(expandedFiles, opts.Output, opts.Severity, opts.Concurrency)
 
 	// Process results
 	var successResults []scanResult
@@ -168,13 +174,70 @@ func main() {
 	fmt.Println("═══════════════════════════════════════════════════════════")
 	fmt.Printf("Total Duration: %s\n", elapsed.Round(time.Second))
 	fmt.Printf("Success: %d | Failed: %d | Total: %d\n",
-		len(successResults), len(failResults), len(opts.Files))
+		len(successResults), len(failResults), len(expandedFiles))
 	fmt.Println("═══════════════════════════════════════════════════════════")
 
 	// Exit with error code if any scan failed
 	if len(failResults) > 0 {
 		os.Exit(1)
 	}
+}
+
+// expandFilePatterns expands glob patterns and validates files exist
+func expandFilePatterns(patterns []string) ([]string, error) {
+	var files []string
+	seen := make(map[string]bool)
+
+	for _, pattern := range patterns {
+		// Check if pattern contains glob characters
+		if strings.ContainsAny(pattern, "*?[]") {
+			// Expand glob pattern
+			matches, err := filepath.Glob(pattern)
+			if err != nil {
+				return nil, fmt.Errorf("invalid pattern '%s': %w", pattern, err)
+			}
+
+			// Add matched files
+			for _, match := range matches {
+				// Check if file exists and is regular file
+				info, err := os.Stat(match)
+				if err != nil {
+					log.Printf("⚠ Warning: Cannot access file '%s': %s", match, err)
+					continue
+				}
+				if info.IsDir() {
+					log.Printf("⚠ Warning: Skipping directory '%s'", match)
+					continue
+				}
+
+				// Add to list if not already added
+				absPath, _ := filepath.Abs(match)
+				if !seen[absPath] {
+					files = append(files, match)
+					seen[absPath] = true
+				}
+			}
+		} else {
+			// Direct file path (no glob)
+			// Check if file exists
+			info, err := os.Stat(pattern)
+			if err != nil {
+				return nil, fmt.Errorf("file '%s' does not exist: %w", pattern, err)
+			}
+			if info.IsDir() {
+				return nil, fmt.Errorf("'%s' is a directory, not a file", pattern)
+			}
+
+			// Add to list if not already added
+			absPath, _ := filepath.Abs(pattern)
+			if !seen[absPath] {
+				files = append(files, pattern)
+				seen[absPath] = true
+			}
+		}
+	}
+
+	return files, nil
 }
 
 // checkTrivyInstalled verifies trivy is installed and accessible
