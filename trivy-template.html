@@ -545,9 +545,9 @@
   <div class="header">
     <div class="logo">TRIVY SCAN<span> //</span></div>
     <div class="header-right">
-      Target: <strong style="color:var(--ac)">{{- escapeXML ( index . 0 ).Target }}</strong>
+      <strong style="color:var(--ac)">{{ escapeXML ( index . 0 ).Target }}</strong>
       &nbsp;·&nbsp;
-      Scan: {{ now | date "2006-01-02 15:04:05 -07:00" }}
+      {{ now | date "2006-01-02 15:04" }}
     </div>
   </div>
 
