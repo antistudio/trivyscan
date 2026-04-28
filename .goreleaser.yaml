@@ -40,7 +40,7 @@ archives:
       - trivy-template.html
 
 checksum:
-  - algorithm: sha256
+  algorithm: sha256
 
 release:
   github:
