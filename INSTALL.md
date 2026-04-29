@@ -49,12 +49,22 @@ chmod +x install.sh
 
 ### Windows
 
-```
-Unzip trivyscan_<version>_amd64.zip
-Double-click install.ps1
+**Step 1:** Unzip `trivyscan_<version>_amd64.zip`
+
+**Step 2:** Open PowerShell as Administrator
+- Press `Win + X` and select "Windows PowerShell (Admin)" or "Terminal (Admin)"
+- Or right-click the Start button → "Windows PowerShell (Admin)"
+
+**Step 3:** Navigate to the extracted folder and run:
+
+```powershell
+cd path\to\extracted\folder
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-_(auto-elevates to Administrator)_
+**Alternative:** Double-click `install.ps1` (may require execution policy adjustment)
+
+> **Note:** Administrator privileges are required to install to `C:\Program Files\` and modify system PATH.
 
 ---
 
@@ -89,9 +99,14 @@ chmod +x update.sh
 
 ### Windows
 
+Open PowerShell as Administrator and run:
+
+```powershell
+cd path\to\extracted\folder
+powershell -ExecutionPolicy Bypass -File .\update.ps1
 ```
-Double-click update.ps1
-```
+
+**Alternative:** Double-click `update.ps1`
 
 ---
 
