@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +15,8 @@ import (
 	"time"
 
 	"github.com/projectdiscovery/goflags"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -80,8 +81,12 @@ func main() {
 		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version information"),
 	)
 
+	// Configure zerolog
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
 	if err := flagSet.Parse(); err != nil {
-		log.Fatalf("Error parsing flags: %s", err)
+		log.Fatal().Err(err).Msg("Error parsing flags")
 	}
 
 	if opts.Version {
@@ -90,48 +95,41 @@ func main() {
 	}
 
 	if opts.Input == "" {
-		log.Fatal("Input is required. Usage: -i file.tar OR -i ./directory")
+		log.Fatal().Msg("Input is required. Usage: -i file.tar OR -i ./directory")
 	}
 
 	// Check trivy installation
 	if !opts.SkipTrivyCheck {
 		if err := checkTrivyInstalled(); err != nil {
-			log.Fatal(err)
+			log.Fatal().Err(err).Msg("Trivy check failed")
 		}
 	}
 
 	// Collect files
 	files, err := collectFiles(opts.Input)
 	if err != nil {
-		log.Fatalf("Error collecting files: %s", err)
+		log.Fatal().Err(err).Msg("Error collecting files")
 	}
 	if len(files) == 0 {
-		log.Fatalf("No .tar files found in: %s", opts.Input)
+		log.Fatal().Msgf("No .tar files found in: %s", opts.Input)
 	}
 
-	fmt.Println("═══════════════════════════════════════════════════════════")
-	fmt.Println("                   TRIVY SCANNER")
-	fmt.Println("═══════════════════════════════════════════════════════════")
+	log.Info().Str("version", version).Msg("TRIVY SCANNER")
+	log.Info().Msg("Starting scan")
 
 	// Update trivy database
 	if !opts.SkipDBUpdate {
 		if err := updateTrivyDB(); err != nil {
-			log.Printf("⚠ Warning: Failed to update trivy database: %s", err)
-			log.Println("Continuing with existing database...")
+			log.Warn().Err(err).Msg("Failed to update trivy database, continuing with existing database")
 		}
-		fmt.Println()
 	}
 
 	// Create output directory
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
-		log.Fatalf("✗ Error creating output directory: %s", err)
+		log.Fatal().Err(err).Msg("Error creating output directory")
 	}
 
-	fmt.Println("───────────────────────────────────────────────────────────")
-	fmt.Printf("Starting scan with %d workers...\n", opts.Concurrency)
-	fmt.Printf("Total files to scan: %d\n", len(files))
-	fmt.Println("───────────────────────────────────────────────────────────")
-	fmt.Println()
+	log.Info().Int("workers", opts.Concurrency).Int("total_files", len(files)).Msg("Starting scan...")
 
 	// Run concurrent scans
 	startTime := time.Now()
@@ -148,45 +146,35 @@ func main() {
 
 	elapsed := time.Since(startTime)
 
-	// Print summary
-	fmt.Println()
-	fmt.Println("═══════════════════════════════════════════════════════════")
-	fmt.Println("                    SCAN SUMMARY")
-	fmt.Println("═══════════════════════════════════════════════════════════")
+	log.Info().Msg("SCAN SUMMARY")
 
 	if len(successResults) > 0 {
-		fmt.Println()
-		fmt.Printf("✓ SUCCESSFUL SCANS (%d):\n", len(successResults))
-		fmt.Println("───────────────────────────────────────────────────────────")
-		for i, r := range successResults {
-			fmt.Printf("%d. Input:  %s\n", i+1, r.File)
-			fmt.Printf("   Output: %s\n", r.OutputFile)
-			fmt.Printf("   Time:   %s\n", r.Duration.Round(time.Millisecond))
-			if i < len(successResults)-1 {
-				fmt.Println()
-			}
+		log.Info().Int("count", len(successResults)).Msg("Successful scans")
+		for _, r := range successResults {
+			log.Info().
+				Str("input", r.File).
+				Str("output", r.OutputFile).
+				Dur("duration", r.Duration.Round(time.Millisecond)).
+				Msg("Success")
 		}
 	}
 
 	if len(failResults) > 0 {
-		fmt.Println()
-		fmt.Printf("✗ FAILED SCANS (%d):\n", len(failResults))
-		fmt.Println("───────────────────────────────────────────────────────────")
-		for i, r := range failResults {
-			fmt.Printf("%d. Input: %s\n", i+1, r.File)
-			fmt.Printf("   Error: %s\n", r.Error)
-			if i < len(failResults)-1 {
-				fmt.Println()
-			}
+		log.Error().Int("count", len(failResults)).Msg("Failed scans")
+		for _, r := range failResults {
+			log.Error().
+				Str("input", r.File).
+				Str("error", r.Error.Error()).
+				Msg("Failed")
 		}
 	}
 
-	fmt.Println()
-	fmt.Println("═══════════════════════════════════════════════════════════")
-	fmt.Printf("Total Duration: %s\n", elapsed.Round(time.Second))
-	fmt.Printf("Success: %d | Failed: %d | Total: %d\n",
-		len(successResults), len(failResults), len(files))
-	fmt.Println("═══════════════════════════════════════════════════════════")
+	log.Info().
+		Dur("total_duration", elapsed.Round(time.Second)).
+		Int("success", len(successResults)).
+		Int("failed", len(failResults)).
+		Int("total", len(files)).
+		Msg("Scan complete")
 
 	if len(failResults) > 0 {
 		os.Exit(1)
@@ -196,20 +184,19 @@ func main() {
 // checkTrivyInstalled verifies trivy is installed, prints helpful install
 // instructions if not found.
 func checkTrivyInstalled() error {
-	fmt.Println("Checking trivy installation...")
+	log.Info().Msg("Checking trivy installation...")
 
 	output, err := exec.Command(trivyCmd, "--version").CombinedOutput()
 	if err != nil {
 		return buildTrivyNotFoundError()
 	}
 
-	fmt.Println("✓ Trivy found:")
+	log.Info().Msg("Trivy found")
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		if line = strings.TrimSpace(line); line != "" {
-			fmt.Printf("  %s\n", line)
+			log.Info().Str("version", line).Send()
 		}
 	}
-	fmt.Println()
 
 	return nil
 }
@@ -265,7 +252,7 @@ func collectFiles(input string) ([]string, error) {
 		}
 	}
 
-	fmt.Printf("Found %d .tar file(s) in directory: %s\n", len(files), input)
+	log.Info().Int("count", len(files)).Str("directory", input).Msg("Found .tar files")
 	return files, nil
 }
 
@@ -279,14 +266,14 @@ func updateTrivyDB() error {
 		{"Java", trivyDownloadJavaDB},
 	}
 
-	fmt.Println("Updating trivy databases...")
+	log.Info().Msg("Updating trivy databases...")
 	for _, db := range databases {
-		fmt.Printf("  • %s database... ", db.name)
+		log.Info().Str("database", db.name).Msg("Updating...")
 		if output, err := exec.Command(trivyCmd, trivySubCmd, db.flag).CombinedOutput(); err != nil {
-			fmt.Println("✗ FAILED")
+			log.Error().Str("database", db.name).Err(err).Msg("Failed to update database")
 			return fmt.Errorf("failed to update %s database: %w\nOutput: %s", db.name, err, output)
 		}
-		fmt.Println("✓ DONE")
+		log.Info().Str("database", db.name).Msg("Updated")
 	}
 
 	return nil
@@ -371,7 +358,7 @@ func scanFile(inputFile, outputDir, severity string) (string, error) {
 
 	out := outputFilename(inputFile, outputDir)
 
-	fmt.Printf("[SCANNING] %s\n", filepath.Base(inputFile))
+	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
 
 	cmd := exec.Command(trivyCmd, trivySubCmd,
 		"--input", inputFile,

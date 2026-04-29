@@ -2,7 +2,10 @@ module github.com/anhnmt/trivyscan
 
 go 1.26
 
-require github.com/projectdiscovery/goflags v0.1.74
+require (
+	github.com/projectdiscovery/goflags v0.1.74
+	github.com/rs/zerolog v1.35.1
+)
 
 require (
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
@@ -10,6 +13,7 @@ require (
 	github.com/cnf/structhash v0.0.0-20250313080605-df4c6cc74a9a // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
