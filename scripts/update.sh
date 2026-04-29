@@ -1,351 +1,191 @@
 #!/bin/bash
 
-# TrivyScan Update Script for Linux/macOS
-# This script updates both Trivy and TrivyScan to their latest versions
-
-set -e
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Configuration
+# =========================================
+# Config
+# =========================================
 INSTALL_DIR="/usr/local/bin"
-TRIVYSCAN_BINARY="trivyscan"
-TRIVY_BINARY="trivy"
-
-# GitHub repositories
-TRIVY_REPO="aquasecurity/trivy"
 TRIVYSCAN_REPO="anhnmt/trivyscan"
 
-# Detect OS and architecture
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+OS=$(uname -s)
 ARCH=$(uname -m)
 
 case "$ARCH" in
-    x86_64)
-        ARCH_TRIVY="64bit"
-        ARCH_GO="amd64"
-        ;;
-    aarch64|arm64)
-        ARCH_TRIVY="ARM64"
-        ARCH_GO="arm64"
-        ;;
+    x86_64)  ARCH_GO="amd64"; ARCH_TRIVY="64bit" ;;
+    aarch64|arm64) ARCH_GO="arm64"; ARCH_TRIVY="ARM64" ;;
     *)
-        echo -e "${RED}✗ Unsupported architecture: $ARCH${NC}"
+        echo "[ERROR] Unsupported architecture: $ARCH"
         exit 1
         ;;
 esac
 
 case "$OS" in
-    linux)
-        OS_NAME="Linux"
-        ;;
-    darwin)
-        OS_NAME="macOS"
-        ;;
+    Linux)  OS_GO="linux";  OS_TRIVY="Linux"  ;;
+    Darwin) OS_GO="darwin"; OS_TRIVY="macOS"  ;;
     *)
-        echo -e "${RED}✗ Unsupported operating system: $OS${NC}"
+        echo "[ERROR] Unsupported OS: $OS"
         exit 1
         ;;
 esac
 
-# Function to check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
+echo "========================================="
+echo "      Trivy + TrivyScan Updater"
+echo "========================================="
+
+trivy_updated=false
+trivyscan_updated=false
+
+# =========================================
+# Helper
+# =========================================
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
 }
 
-# Function to get latest version from GitHub
-get_latest_version() {
-    local repo=$1
-    local version
-    
-    if command_exists curl; then
-        version=$(curl -s "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    elif command_exists wget; then
-        version=$(wget -qO- "https://api.github.com/repos/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-    else
-        echo ""
-        return 1
+fetch_latest_version() {
+    local repo="$1"
+    local version=""
+
+    if command -v curl &>/dev/null; then
+        version=$(curl -s "https://api.github.com/repos/$repo/releases/latest" \
+            | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    elif command -v wget &>/dev/null; then
+        version=$(wget -qO- "https://api.github.com/repos/$repo/releases/latest" \
+            | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
     fi
-    
+
     echo "$version"
 }
 
-# Function to get current installed version
-get_installed_version() {
-    local binary=$1
-    local version
-    
-    if command_exists "$binary"; then
-        version=$("$binary" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        echo "$version"
-    else
-        echo ""
-    fi
-}
-
-# Function to compare versions
-version_gt() {
-    test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"
-}
-
-# Function to check write permission
-check_write_permission() {
-    if [ -w "$1" ]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Function to update with sudo if needed
-update_binary() {
-    local source=$1
-    local target=$2
-    
-    if check_write_permission "$(dirname "$target")"; then
-        echo -e "${BLUE}Updating $target...${NC}"
-        cp "$source" "$target"
-        chmod 755 "$target"
-    else
-        echo -e "${YELLOW}⚠ Requires sudo to update $target${NC}"
-        sudo cp "$source" "$target"
-        sudo chmod 755 "$target"
-    fi
-}
-
-# Function to update Trivy
-update_trivy() {
-    echo -e "${BLUE}Fetching latest Trivy version...${NC}"
-    local latest_version=$(get_latest_version "$TRIVY_REPO")
-    
-    if [ -z "$latest_version" ]; then
-        echo -e "${RED}✗ Failed to fetch latest Trivy version${NC}"
-        return 1
-    fi
-    
-    echo -e "${GREEN}✓ Latest Trivy version: v$latest_version${NC}"
-    
-    local current_version=$(get_installed_version "trivy")
-    if [ -n "$current_version" ]; then
-        echo -e "${BLUE}  Current installed: v$current_version${NC}"
-        
-        if [ "$current_version" = "$latest_version" ]; then
-            echo -e "${GREEN}✓ Trivy is already up to date!${NC}"
-            return 0
-        elif version_gt "$current_version" "$latest_version"; then
-            echo -e "${YELLOW}⚠ Installed version is newer than latest release${NC}"
-            read -p "Do you want to downgrade to v$latest_version? (y/N) " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                echo -e "${BLUE}Skipping Trivy update${NC}"
-                return 0
-            fi
-        fi
-    else
-        echo -e "${YELLOW}⚠ Trivy is not installed${NC}"
-    fi
-    
-    echo ""
-    
-    # Check for package managers first
-    if [ "$OS" = "darwin" ] && command_exists brew; then
-        echo -e "${BLUE}Using Homebrew to update Trivy...${NC}"
-        brew upgrade aquasecurity/trivy/trivy || brew install aquasecurity/trivy/trivy
-        echo -e "${GREEN}✓ Trivy updated successfully via Homebrew!${NC}"
-        return 0
-    elif [ "$OS" = "linux" ] && command_exists apt-get; then
-        echo -e "${BLUE}Using APT to update Trivy...${NC}"
-        sudo apt-get update
-        sudo apt-get install --only-upgrade trivy -y || sudo apt-get install trivy -y
-        echo -e "${GREEN}✓ Trivy updated successfully via APT!${NC}"
-        return 0
-    elif [ "$OS" = "linux" ] && command_exists yum; then
-        echo -e "${BLUE}Using YUM to update Trivy...${NC}"
-        sudo yum update trivy -y || sudo yum install trivy -y
-        echo -e "${GREEN}✓ Trivy updated successfully via YUM!${NC}"
-        return 0
-    fi
-    
-    # Manual update
-    echo -e "${BLUE}Updating Trivy manually...${NC}"
-    
-    TRIVY_URL="https://github.com/$TRIVY_REPO/releases/download/v${latest_version}/trivy_${latest_version}_${OS_NAME}-${ARCH_TRIVY}.tar.gz"
-    TEMP_DIR=$(mktemp -d)
-    
-    echo "Downloading from: $TRIVY_URL"
-    if command_exists curl; then
-        curl -sL "$TRIVY_URL" -o "$TEMP_DIR/trivy.tar.gz"
-    elif command_exists wget; then
-        wget -q "$TRIVY_URL" -O "$TEMP_DIR/trivy.tar.gz"
-    else
-        echo -e "${RED}✗ Neither curl nor wget is available${NC}"
-        rm -rf "$TEMP_DIR"
-        return 1
-    fi
-    
-    echo "Extracting..."
-    tar -xzf "$TEMP_DIR/trivy.tar.gz" -C "$TEMP_DIR"
-    
-    echo "Installing Trivy..."
-    update_binary "$TEMP_DIR/trivy" "$INSTALL_DIR/trivy"
-    
-    # Cleanup
-    rm -rf "$TEMP_DIR"
-    
-    echo -e "${GREEN}✓ Trivy updated successfully!${NC}"
-    return 0
-}
-
-# Function to update TrivyScan
-update_trivyscan() {
-    echo -e "${BLUE}Fetching latest TrivyScan version...${NC}"
-    local latest_version=$(get_latest_version "$TRIVYSCAN_REPO")
-    
-    if [ -z "$latest_version" ]; then
-        echo -e "${RED}✗ Failed to fetch latest TrivyScan version${NC}"
-        return 1
-    fi
-    
-    echo -e "${GREEN}✓ Latest TrivyScan version: v$latest_version${NC}"
-    
-    local current_version=$(get_installed_version "trivyscan")
-    if [ -n "$current_version" ]; then
-        echo -e "${BLUE}  Current installed: v$current_version${NC}"
-        
-        if [ "$current_version" = "$latest_version" ]; then
-            echo -e "${GREEN}✓ TrivyScan is already up to date!${NC}"
-            return 0
-        elif version_gt "$current_version" "$latest_version"; then
-            echo -e "${YELLOW}⚠ Installed version is newer than latest release${NC}"
-            read -p "Do you want to downgrade to v$latest_version? (y/N) " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                echo -e "${BLUE}Skipping TrivyScan update${NC}"
-                return 0
-            fi
-        fi
-    else
-        echo -e "${YELLOW}⚠ TrivyScan is not installed${NC}"
-    fi
-    
-    echo ""
-    echo -e "${BLUE}Updating TrivyScan manually...${NC}"
-    
-    TRIVYSCAN_URL="https://github.com/$TRIVYSCAN_REPO/releases/download/v${latest_version}/trivyscan_${latest_version}_${OS}_${ARCH_GO}.tar.gz"
-    TEMP_DIR=$(mktemp -d)
-    
-    echo "Downloading from: $TRIVYSCAN_URL"
-    if command_exists curl; then
-        curl -sL "$TRIVYSCAN_URL" -o "$TEMP_DIR/trivyscan.tar.gz"
-    elif command_exists wget; then
-        wget -q "$TRIVYSCAN_URL" -O "$TEMP_DIR/trivyscan.tar.gz"
-    else
-        echo -e "${RED}✗ Neither curl nor wget is available${NC}"
-        rm -rf "$TEMP_DIR"
-        return 1
-    fi
-    
-    echo "Extracting..."
-    tar -xzf "$TEMP_DIR/trivyscan.tar.gz" -C "$TEMP_DIR"
-    
-    echo "Installing TrivyScan..."
-    update_binary "$TEMP_DIR/trivyscan" "$INSTALL_DIR/trivyscan"
-    
-    # Cleanup
-    rm -rf "$TEMP_DIR"
-    
-    echo -e "${GREEN}✓ TrivyScan updated successfully!${NC}"
-    return 0
-}
-
-echo "═══════════════════════════════════════════════════════════"
-echo "           TrivyScan Update Script"
-echo "═══════════════════════════════════════════════════════════"
+# =========================================
+# Step 1: Update Trivy
+# =========================================
 echo ""
-echo "OS: $OS_NAME"
-echo "Architecture: $ARCH ($ARCH_GO)"
-echo "Install Directory: $INSTALL_DIR"
-echo ""
+echo "[INFO] Fetching latest Trivy version..."
 
-# Step 1: Update Trivy (priority)
-echo "───────────────────────────────────────────────────────────"
-echo "Step 1: Updating Trivy..."
-echo "───────────────────────────────────────────────────────────"
-echo ""
+latest_trivy=$(fetch_latest_version "aquasecurity/trivy")
 
-if update_trivy; then
-    TRIVY_UPDATED=true
+if [ -z "$latest_trivy" ]; then
+    echo "[WARN] Cannot fetch Trivy version - skipping"
 else
-    TRIVY_UPDATED=false
-    echo -e "${YELLOW}⚠ Trivy update failed, continuing...${NC}"
+    echo "[OK] Latest Trivy version: $latest_trivy"
+
+    current_trivy=""
+    if command -v trivy &>/dev/null; then
+        current_trivy=$(trivy --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        echo "[INFO] Installed version: $current_trivy"
+    fi
+
+    if [ "$current_trivy" = "$latest_trivy" ]; then
+        echo "[OK] Trivy is already up to date"
+    else
+        url="https://github.com/aquasecurity/trivy/releases/download/v${latest_trivy}/trivy_${latest_trivy}_${OS_TRIVY}-${ARCH_TRIVY}.tar.gz"
+        tmp_archive="/tmp/trivy.tar.gz"
+        tmp_dir="/tmp/trivy_extract"
+
+        echo "[INFO] Downloading Trivy from: $url"
+        if command -v curl &>/dev/null; then
+            curl -fsSL "$url" -o "$tmp_archive"
+        else
+            wget -q "$url" -O "$tmp_archive"
+        fi
+
+        if [ ! -f "$tmp_archive" ]; then
+            echo "[ERROR] Download failed"
+        else
+            echo "[INFO] Extracting..."
+            rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
+            tar -xzf "$tmp_archive" -C "$tmp_dir"
+            rm -f "$tmp_archive"
+
+            if [ ! -f "$tmp_dir/trivy" ]; then
+                echo "[ERROR] trivy binary not found after extraction"
+            else
+                run_privileged cp "$tmp_dir/trivy" "$INSTALL_DIR/trivy"
+                run_privileged chmod 755 "$INSTALL_DIR/trivy"
+                rm -rf "$tmp_dir"
+                echo "[OK] Trivy updated to v$latest_trivy"
+                trivy_updated=true
+            fi
+        fi
+    fi
 fi
 
-echo ""
-
+# =========================================
 # Step 2: Update TrivyScan
-echo "───────────────────────────────────────────────────────────"
-echo "Step 2: Updating TrivyScan..."
-echo "───────────────────────────────────────────────────────────"
+# =========================================
 echo ""
+echo "[INFO] Fetching latest TrivyScan version..."
 
-if update_trivyscan; then
-    TRIVYSCAN_UPDATED=true
+latest_trivyscan=$(fetch_latest_version "$TRIVYSCAN_REPO")
+
+if [ -z "$latest_trivyscan" ]; then
+    echo "[WARN] Cannot fetch TrivyScan version - skipping"
 else
-    TRIVYSCAN_UPDATED=false
-    echo -e "${YELLOW}⚠ TrivyScan update failed${NC}"
+    echo "[OK] Latest TrivyScan version: $latest_trivyscan"
+
+    current_trivyscan=""
+    if command -v trivyscan &>/dev/null; then
+        current_trivyscan=$(trivyscan --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        echo "[INFO] Installed version: $current_trivyscan"
+    fi
+
+    if [ "$current_trivyscan" = "$latest_trivyscan" ]; then
+        echo "[OK] TrivyScan is already up to date"
+    else
+        url="https://github.com/$TRIVYSCAN_REPO/releases/download/v${latest_trivyscan}/trivyscan_${latest_trivyscan}_${OS_GO}_${ARCH_GO}.zip"
+        tmp_archive="/tmp/trivyscan.zip"
+        tmp_dir="/tmp/trivyscan_extract"
+
+        echo "[INFO] Downloading TrivyScan from: $url"
+        if command -v curl &>/dev/null; then
+            curl -fsSL "$url" -o "$tmp_archive"
+        else
+            wget -q "$url" -O "$tmp_archive"
+        fi
+
+        if [ ! -f "$tmp_archive" ]; then
+            echo "[ERROR] Download failed"
+        else
+            echo "[INFO] Extracting..."
+            rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
+            unzip -q "$tmp_archive" -d "$tmp_dir"
+            rm -f "$tmp_archive"
+
+            if [ ! -f "$tmp_dir/trivyscan" ]; then
+                echo "[ERROR] trivyscan binary not found after extraction"
+            else
+                run_privileged cp "$tmp_dir/trivyscan" "$INSTALL_DIR/trivyscan"
+                run_privileged chmod 755 "$INSTALL_DIR/trivyscan"
+                rm -rf "$tmp_dir"
+                echo "[OK] TrivyScan updated to v$latest_trivyscan"
+                trivyscan_updated=true
+            fi
+        fi
+    fi
 fi
 
+# =========================================
+# Step 3: Verify
+# =========================================
 echo ""
+echo "[INFO] Verifying..."
 
-# Step 3: Verify updates
-echo "───────────────────────────────────────────────────────────"
-echo "Step 3: Verifying updates..."
-echo "───────────────────────────────────────────────────────────"
-echo ""
+command -v trivy &>/dev/null    && trivy --version
+command -v trivyscan &>/dev/null && trivyscan --version
 
-if command_exists trivy; then
-    echo "Trivy version:"
-    trivy --version
-    echo ""
-fi
-
-if command_exists trivyscan; then
-    echo "TrivyScan version:"
-    trivyscan --version
-    echo ""
-fi
-
+# =========================================
 # Summary
-echo "═══════════════════════════════════════════════════════════"
-echo "              Update Summary"
-echo "═══════════════════════════════════════════════════════════"
+# =========================================
 echo ""
-
-if [ "$TRIVY_UPDATED" = true ]; then
-    echo -e "${GREEN}✓ Trivy updated successfully${NC}"
-else
-    echo -e "${YELLOW}⚠ Trivy update skipped or failed${NC}"
+echo "========================================="
+if $trivy_updated;     then echo "[OK] Trivy     -> updated to v$latest_trivy"
+else                        echo "[--] Trivy     -> already up to date"
 fi
-
-if [ "$TRIVYSCAN_UPDATED" = true ]; then
-    echo -e "${GREEN}✓ TrivyScan updated successfully${NC}"
-else
-    echo -e "${YELLOW}⚠ TrivyScan update skipped or failed${NC}"
+if $trivyscan_updated; then echo "[OK] TrivyScan -> updated to v$latest_trivyscan"
+else                        echo "[--] TrivyScan -> already up to date"
 fi
-
-echo ""
-echo "═══════════════════════════════════════════════════════════"
-echo ""
-
-if [ "$TRIVY_UPDATED" = true ] || [ "$TRIVYSCAN_UPDATED" = true ]; then
-    echo "Update completed! 🚀"
-    exit 0
-else
-    echo "No updates were performed."
-    exit 1
-fi
+echo "========================================="
