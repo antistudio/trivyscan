@@ -1,17 +1,23 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/projectdiscovery/goflags"
@@ -71,6 +77,20 @@ const (
 	trivyInstallURL     = "https://aquasecurity.github.io/trivy/latest/getting-started/installation/"
 
 	hashLength = 6
+
+	// Retry configuration
+	maxRetries        = 3
+	initialBackoff    = 2 * time.Second
+	maxBackoff        = 30 * time.Second
+	backoffMultiplier = 2.0
+	jitterFactor      = 0.1
+
+	// Circuit breaker configuration
+	circuitBreakerThreshold = 5
+	circuitBreakerTimeout   = 30 * time.Second
+
+	// Scan timeout per file
+	scanTimeout = 10 * time.Minute
 )
 
 type options struct {
@@ -81,6 +101,8 @@ type options struct {
 	SkipDBUpdate   bool
 	SkipTrivyCheck bool
 	Version        bool
+	MaxRetries     int
+	ScanTimeout    time.Duration
 }
 
 type scanResult struct {
@@ -88,6 +110,183 @@ type scanResult struct {
 	OutputFile string
 	Error      error
 	Duration   time.Duration
+	RetryCount int
+}
+
+// CircuitBreaker implements the circuit breaker pattern to prevent cascading failures
+type CircuitBreaker struct {
+	mu            sync.RWMutex
+	failures      int32
+	lastFailure   time.Time
+	state         atomic.Int32 // 0: closed, 1: open, 2: half-open
+	threshold     int32
+	timeout       time.Duration
+	onStateChange func(string, string)
+}
+
+const (
+	circuitClosed   int32 = 0
+	circuitOpen     int32 = 1
+	circuitHalfOpen int32 = 2
+)
+
+func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
+	cb := &CircuitBreaker{
+		threshold: int32(threshold),
+		timeout:   timeout,
+	}
+	cb.state.Store(circuitClosed)
+	return cb
+}
+
+func (cb *CircuitBreaker) Allow() bool {
+	state := cb.state.Load()
+
+	switch state {
+	case circuitClosed:
+		return true
+	case circuitOpen:
+		// Check if timeout has passed to transition to half-open
+		cb.mu.RLock()
+		if time.Since(cb.lastFailure) > cb.timeout {
+			cb.mu.RUnlock()
+			cb.state.Store(circuitHalfOpen)
+			if cb.onStateChange != nil {
+				go cb.onStateChange("open", "half-open")
+			}
+			return true
+		}
+		cb.mu.RUnlock()
+		return false
+	case circuitHalfOpen:
+		return true
+	default:
+		return false
+	}
+}
+
+func (cb *CircuitBreaker) RecordSuccess() {
+	if cb.state.Load() == circuitHalfOpen {
+		cb.state.Store(circuitClosed)
+		atomic.StoreInt32(&cb.failures, 0)
+		if cb.onStateChange != nil {
+			go cb.onStateChange("half-open", "closed")
+		}
+	}
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+	atomic.AddInt32(&cb.failures, 1)
+	cb.mu.Lock()
+	cb.lastFailure = time.Now()
+	cb.mu.Unlock()
+
+	failures := atomic.LoadInt32(&cb.failures)
+	if failures >= cb.threshold && cb.state.Load() != circuitOpen {
+		cb.state.Store(circuitOpen)
+		if cb.onStateChange != nil {
+			go cb.onStateChange("closed", "open")
+		}
+	}
+}
+
+func (cb *CircuitBreaker) State() string {
+	switch cb.state.Load() {
+	case circuitClosed:
+		return "closed"
+	case circuitOpen:
+		return "open"
+	case circuitHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
+
+// calculateBackoff calculates exponential backoff with jitter
+func calculateBackoff(attempt int) time.Duration {
+	backoff := float64(initialBackoff) * math.Pow(backoffMultiplier, float64(attempt))
+	if backoff > float64(maxBackoff) {
+		backoff = float64(maxBackoff)
+	}
+
+	// Add jitter to prevent thundering herd
+	jitter := backoff * jitterFactor * (2*math.Max(0, math.Min(1, float64(time.Now().UnixNano()%1000)/1000.0)) - 1)
+	backoff += jitter
+
+	return time.Duration(backoff)
+}
+
+// isRetryableError determines if an error should trigger a retry
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Retry on network-related errors, timeout errors, and transient failures
+	retryablePatterns := []string{
+		"context deadline exceeded",
+		"context canceled",
+		"connection refused",
+		"connection reset",
+		"temporary failure",
+		"timeout",
+		"i/o timeout",
+		"no such host",
+		"network",
+		"connection",
+	}
+
+	for _, pattern := range retryablePatterns {
+		if strings.Contains(strings.ToLower(errStr), strings.ToLower(pattern)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// runWithRetry executes a function with exponential backoff retry
+func runWithRetry(ctx context.Context, operation string, fn func() error) error {
+	maxAttempts := maxRetries
+
+	for attempt := 0; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
+		default:
+		}
+
+		err := fn()
+		if err == nil {
+			return nil
+		}
+
+		// Check if we should retry
+		if attempt >= maxAttempts || !isRetryableError(err) {
+			return err
+		}
+
+		backoff := calculateBackoff(attempt)
+		log.Warn().
+			Int("attempt", attempt+1).
+			Int("max_attempts", maxAttempts+1).
+			Dur("backoff", backoff).
+			Str("operation", operation).
+			Err(err).
+			Msg("Operation failed, will retry")
+
+		// Wait with context cancellation support
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
+		case <-time.After(backoff):
+		}
+	}
+
+	return fmt.Errorf("%s failed after %d attempts", operation, maxAttempts+1)
 }
 
 func main() {
@@ -109,6 +308,7 @@ func main() {
 		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels to report"),
 		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip trivy database update"),
 		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy installation check"),
+		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "r", maxRetries, "maximum number of retry attempts per scan"),
 	)
 
 	flagSet.CreateGroup("info", "Info",
@@ -131,9 +331,23 @@ func main() {
 		log.Fatal().Msg("Input is required. Usage: -i file.tar OR -i ./directory")
 	}
 
+	// Create cancellable context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		sig := <-sigChan
+		log.Warn().Str("signal", sig.String()).Msg("Received shutdown signal, cancelling operations...")
+		cancel()
+	}()
+
 	// Check trivy installation
 	if !opts.SkipTrivyCheck {
-		if err := checkTrivyInstalled(); err != nil {
+		if err := checkTrivyInstalled(ctx); err != nil {
 			log.Fatal().Err(err).Msg("Trivy check failed")
 		}
 	}
@@ -152,7 +366,7 @@ func main() {
 
 	// Update trivy database
 	if !opts.SkipDBUpdate {
-		if err := updateTrivyDB(); err != nil {
+		if err := updateTrivyDB(ctx); err != nil {
 			log.Warn().Err(err).Msg("Failed to update trivy database, continuing with existing database")
 		}
 	}
@@ -164,17 +378,24 @@ func main() {
 
 	log.Info().Int("workers", opts.Concurrency).Int("total_files", len(files)).Msg("Starting scan...")
 
-	// Run concurrent scans
+	// Run concurrent scans with cancellation support
 	startTime := time.Now()
-	results := scanFilesAsync(files, opts.Output, opts.Severity, opts.Concurrency)
+	results := scanFilesAsync(ctx, files, opts.Output, opts.Severity, opts.Concurrency, opts.MaxRetries)
 
 	var successResults, failResults []scanResult
+	var completedCount int32
+
 	for result := range results {
+		atomic.AddInt32(&completedCount, 1)
 		if result.Error != nil {
 			failResults = append(failResults, result)
 		} else {
 			successResults = append(successResults, result)
 		}
+		log.Info().
+			Int("completed", int(atomic.LoadInt32(&completedCount))).
+			Int("total", len(files)).
+			Msg("Progress")
 	}
 
 	elapsed := time.Since(startTime)
@@ -188,6 +409,7 @@ func main() {
 				Str("input", r.File).
 				Str("output", r.OutputFile).
 				Dur("duration", r.Duration.Round(time.Millisecond)).
+				Int("retries", r.RetryCount).
 				Msg("Success")
 		}
 	}
@@ -198,6 +420,7 @@ func main() {
 			log.Error().
 				Str("input", r.File).
 				Str("error", r.Error.Error()).
+				Int("retries", r.RetryCount).
 				Msg("Failed")
 		}
 	}
@@ -216,17 +439,21 @@ func main() {
 
 // checkTrivyInstalled verifies trivy is installed, prints helpful install
 // instructions if not found.
-func checkTrivyInstalled() error {
+func checkTrivyInstalled(ctx context.Context) error {
 	log.Info().Msg("Checking trivy installation...")
 
-	output, err := exec.Command(trivyCmd, "--version").CombinedOutput()
-	if err != nil {
-		return buildTrivyNotFoundError()
-	}
+	return runWithRetry(ctx, "trivy version check", func() error {
+		output, err := exec.CommandContext(ctx, trivyCmd, "--version").CombinedOutput()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return buildTrivyNotFoundError()
+		}
 
-	log.Info().Msgf("Trivy found \n%s", strings.TrimSpace(string(output)))
-
-	return nil
+		log.Info().Msgf("Trivy found \n%s", strings.TrimSpace(string(output)))
+		return nil
+	})
 }
 
 // buildTrivyNotFoundError returns a descriptive error with install instructions
@@ -234,7 +461,7 @@ func checkTrivyInstalled() error {
 func buildTrivyNotFoundError() error {
 	var sb strings.Builder
 
-	sb.WriteString("✗ Trivy is not installed or not in PATH.\n\n")
+	sb.WriteString("Trivy is not installed or not in PATH.\n\n")
 
 	switch runtime.GOOS {
 	case "windows":
@@ -248,7 +475,7 @@ func buildTrivyNotFoundError() error {
 	sb.WriteString("  Or install manually:\n")
 	sb.WriteString("    " + trivyInstallURL)
 
-	return fmt.Errorf("%s", sb.String())
+	return errors.New(sb.String())
 }
 
 // collectFiles collects .tar files from a file or directory path.
@@ -285,7 +512,7 @@ func collectFiles(input string) ([]string, error) {
 }
 
 // updateTrivyDB updates the Trivy vulnerability and Java databases.
-func updateTrivyDB() error {
+func updateTrivyDB(ctx context.Context) error {
 	databases := []struct {
 		name string
 		flag string
@@ -295,13 +522,35 @@ func updateTrivyDB() error {
 	}
 
 	log.Info().Msg("Updating trivy databases...")
+
 	for _, db := range databases {
-		log.Info().Str("database", db.name).Msg("Updating...")
-		if output, err := exec.Command(trivyCmd, trivySubCmd, db.flag).CombinedOutput(); err != nil {
-			log.Error().Str("database", db.name).Err(err).Msg("Failed to update database")
-			return fmt.Errorf("failed to update %s database: %w\nOutput: %s", db.name, err, output)
+		// Check if context was cancelled
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
-		log.Info().Str("database", db.name).Msg("Updated")
+
+		dbName := db.name
+		dbFlag := db.flag
+
+		err := runWithRetry(ctx, "trivy database update", func() error {
+			cmd := exec.CommandContext(ctx, trivyCmd, trivySubCmd, dbFlag)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("failed to update %s database: %w\nOutput: %s", dbName, err, output)
+			}
+			return nil
+		})
+
+		if err != nil {
+			log.Error().Str("database", dbName).Err(err).Msg("Failed to update database")
+			return fmt.Errorf("failed to update %s database: %w", dbName, err)
+		}
+		log.Info().Str("database", dbName).Msg("Updated")
 	}
 
 	return nil
@@ -339,30 +588,72 @@ func outputFilename(inputFile, outputDir string) string {
 	return filepath.Join(outputDir, fmt.Sprintf("%s_%s-report.html", base, hash))
 }
 
-// scanFilesAsync runs scans concurrently using a worker pool and returns a
-// channel of results that is closed when all scans complete.
-func scanFilesAsync(files []string, outputDir, severity string, concurrency int) <-chan scanResult {
+// scanFilesAsync runs scans concurrently using a worker pool with proper context handling
+// and returns a channel of results that is closed when all scans complete.
+func scanFilesAsync(ctx context.Context, files []string, outputDir, severity string, concurrency int, maxRetries int) <-chan scanResult {
 	results := make(chan scanResult, len(files))
 	jobs := make(chan string, len(files))
 
+	// Create circuit breaker for handling transient failures
+	cb := NewCircuitBreaker(circuitBreakerThreshold, circuitBreakerTimeout)
+	cb.onStateChange = func(from, to string) {
+		log.Warn().Str("from", from).Str("to", to).Msg("Circuit breaker state changed")
+	}
+
 	var wg sync.WaitGroup
+
+	// Start workers
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for file := range jobs {
+				// Check context before processing each job
+				select {
+				case <-ctx.Done():
+					results <- scanResult{
+						File:       file,
+						Error:      ctx.Err(),
+						Duration:   0,
+						RetryCount: 0,
+					}
+					continue
+				default:
+				}
+
 				start := time.Now()
-				out, err := scanFile(file, outputDir, severity)
+
+				// Check circuit breaker
+				if !cb.Allow() {
+					results <- scanResult{
+						File:       file,
+						Error:      fmt.Errorf("circuit breaker is open, skipping scan"),
+						Duration:   time.Since(start),
+						RetryCount: 0,
+					}
+					continue
+				}
+
+				out, err := scanFileWithRetry(ctx, file, outputDir, severity, maxRetries)
+
+				if err != nil {
+					cb.RecordFailure()
+				} else {
+					cb.RecordSuccess()
+				}
+
 				results <- scanResult{
 					File:       file,
 					OutputFile: out,
 					Error:      err,
 					Duration:   time.Since(start),
+					RetryCount: 0,
 				}
 			}
-		}()
+		}(i)
 	}
 
+	// Send jobs and close
 	go func() {
 		for _, f := range files {
 			jobs <- f
@@ -370,12 +661,100 @@ func scanFilesAsync(files []string, outputDir, severity string, concurrency int)
 		close(jobs)
 	}()
 
+	// Wait for all workers and close results
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
 	return results
+}
+
+// scanFileWithRetry runs trivy scan with retry logic
+func scanFileWithRetry(ctx context.Context, inputFile, outputDir, severity string, maxRetries int) (string, error) {
+	var lastErr error
+	var outputFile string
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Check context before each attempt
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		out, err := scanFileWithTimeout(ctx, inputFile, outputDir, severity)
+		if err == nil {
+			return out, nil
+		}
+
+		lastErr = err
+
+		// Don't retry if error is not retryable
+		if !isRetryableError(err) {
+			return "", err
+		}
+
+		// Don't wait after last attempt
+		if attempt >= maxRetries {
+			break
+		}
+
+		backoff := calculateBackoff(attempt)
+		log.Warn().
+			Str("file", filepath.Base(inputFile)).
+			Int("attempt", attempt+1).
+			Int("max_attempts", maxRetries+1).
+			Dur("backoff", backoff).
+			Err(err).
+			Msg("Scan failed, will retry")
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	return outputFile, fmt.Errorf("scan failed after %d attempts: %w", maxRetries+1, lastErr)
+}
+
+// scanFileWithTimeout runs trivy against a single .tar file with a timeout
+func scanFileWithTimeout(ctx context.Context, inputFile, outputDir, severity string) (string, error) {
+	// Create a timeout context for the scan
+	scanCtx, cancel := context.WithTimeout(ctx, scanTimeout)
+	defer cancel()
+
+	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
+		return "", fmt.Errorf("file does not exist: %s", inputFile)
+	}
+
+	out := outputFilename(inputFile, outputDir)
+
+	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
+
+	cmd := exec.CommandContext(scanCtx, trivyCmd, trivySubCmd,
+		"--input", inputFile,
+		"--severity", severity,
+		"--format", "template",
+		"--template", templateContent,
+		"--output", out,
+		trivySkipDB,
+		trivySkipJavaDB,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if scanCtx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("scan timed out after %v: %w", scanTimeout, err)
+		}
+		if scanCtx.Err() != nil {
+			return "", scanCtx.Err()
+		}
+		return "", fmt.Errorf("trivy command failed: %w\nOutput: %s", err, output)
+	}
+
+	return out, nil
 }
 
 // scanFile runs trivy against a single .tar file and writes an HTML report.
