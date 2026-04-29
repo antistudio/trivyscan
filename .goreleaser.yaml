@@ -69,6 +69,7 @@ archives:
     files:
       - LICENSE*
       - README*
+      - INSTALL*
       - src: scripts/install.sh
         dst: install.sh
         strip_parent: true
@@ -93,6 +94,7 @@ archives:
     files:
       - LICENSE*
       - README*
+      - INSTALL*
       - src: scripts/install.bat
         dst: install.bat
         strip_parent: true
