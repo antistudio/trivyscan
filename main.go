@@ -25,6 +25,50 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// TrivySemaphore limits concurrent Trivy executions to prevent database locking
+var TrivySemaphore *Semaphore
+
+// Semaphore implements a simple counting semaphore with proper locking
+type Semaphore struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	value int
+	max   int
+}
+
+// NewSemaphore creates a new semaphore with the given maximum value
+func NewSemaphore(max int) *Semaphore {
+	s := &Semaphore{max: max}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+// Acquire takes one unit from the semaphore, blocking if none available
+func (s *Semaphore) Acquire(ctx context.Context) error {
+	s.cond.L.Lock()
+	for s.value >= s.max {
+		// Check if context is cancelled while waiting
+		select {
+		case <-ctx.Done():
+			s.cond.L.Unlock()
+			return ctx.Err()
+		default:
+			s.cond.Wait()
+		}
+	}
+	s.value++
+	s.cond.L.Unlock()
+	return nil
+}
+
+// Release returns one unit to the semaphore
+func (s *Semaphore) Release() {
+	s.cond.L.Lock()
+	s.value--
+	s.cond.Signal()
+	s.cond.L.Unlock()
+}
+
 // zerologPrettySetup configures zerolog with a pretty console output
 func zerologPrettySetup() {
 	zerolog.TimeFieldFormat = time.RFC3339
@@ -237,6 +281,11 @@ func isRetryableError(err error) bool {
 		"no such host",
 		"network",
 		"connection",
+		// Trivy database lock errors
+		"database is locked",
+		"database locked",
+		"SQLITE_BUSY",
+		"SQLITE_LOCKED",
 	}
 
 	for _, pattern := range retryablePatterns {
@@ -377,6 +426,11 @@ func main() {
 	}
 
 	log.Info().Int("workers", opts.Concurrency).Int("total_files", len(files)).Msg("Starting scan...")
+
+	// Initialize Trivy semaphore to prevent database lock issues
+	// Trivy uses SQLite which locks on write, so we limit concurrent executions
+	TrivySemaphore = NewSemaphore(opts.Concurrency)
+	log.Info().Int("trivy_limit", opts.Concurrency).Msg("Trivy semaphore initialized (prevents database lock)")
 
 	// Run concurrent scans with cancellation support
 	startTime := time.Now()
@@ -670,7 +724,7 @@ func scanFilesAsync(ctx context.Context, files []string, outputDir, severity str
 	return results
 }
 
-// scanFileWithRetry runs trivy scan with retry logic
+// scanFileWithRetry runs trivy scan with retry logic and semaphore to prevent DB lock
 func scanFileWithRetry(ctx context.Context, inputFile, outputDir, severity string, maxRetries int) (string, error) {
 	var lastErr error
 	var outputFile string
@@ -683,7 +737,17 @@ func scanFileWithRetry(ctx context.Context, inputFile, outputDir, severity strin
 		default:
 		}
 
+		// Acquire semaphore to prevent Trivy database lock
+		// This serializes Trivy executions that might conflict on SQLite
+		if err := TrivySemaphore.Acquire(ctx); err != nil {
+			return "", fmt.Errorf("failed to acquire semaphore: %w", err)
+		}
+
 		out, err := scanFileWithTimeout(ctx, inputFile, outputDir, severity)
+
+		// Always release semaphore
+		TrivySemaphore.Release()
+
 		if err == nil {
 			return out, nil
 		}
