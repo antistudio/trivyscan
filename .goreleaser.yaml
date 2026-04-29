@@ -67,8 +67,6 @@ archives:
     builds:
       - trivyscan
     files:
-      - LICENSE*
-      - README*
       - INSTALL*
       - src: scripts/install.sh
         dst: install.sh
@@ -92,8 +90,6 @@ archives:
     builds:
       - trivyscan
     files:
-      - LICENSE*
-      - README*
       - INSTALL*
       - src: scripts/install.bat
         dst: install.bat
