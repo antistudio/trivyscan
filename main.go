@@ -19,6 +19,62 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// zerologPrettySetup configures zerolog with a pretty console output
+func zerologPrettySetup() {
+	zerolog.TimeFieldFormat = time.RFC3339
+
+	output := zerolog.ConsoleWriter{
+		Out:        os.Stderr,
+		TimeFormat: time.RFC3339,
+		FormatMessage: func(i interface{}) string {
+			return fmt.Sprintf(" %s", i)
+		},
+		FormatLevel: func(i interface{}) string {
+			var l string
+			if ll, ok := i.(string); ok {
+				switch ll {
+				case "debug":
+					l = "⬡ DBG"
+				case "info":
+					l = "✦ INFO"
+				case "warn":
+					l = "⚠ WARN"
+				case "error":
+					l = "✗ ERROR"
+				case "fatal":
+					l = "✗ FATAL"
+				case "panic":
+					l = "✗ PANIC"
+				default:
+					l = "• " + ll
+				}
+			}
+			return l
+		},
+		FormatCaller: func(i interface{}) string {
+			var s string
+			if c, ok := i.(string); ok {
+				s = c
+			}
+			if len(s) > 0 {
+				if idx := strings.LastIndex(s, "/"); idx >= 0 {
+					s = s[idx+1:]
+				}
+				if idx := strings.LastIndex(s, "\\"); idx >= 0 {
+					s = s[idx+1:]
+				}
+			}
+			return s
+		},
+	}
+
+	log.Logger = zerolog.New(output).
+		With().
+		Timestamp().
+		Caller().
+		Logger()
+}
+
 var (
 	// version is set via ldflags at build time
 	version = "dev"
@@ -81,9 +137,8 @@ func main() {
 		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version information"),
 	)
 
-	// Configure zerolog
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	// Configure zerolog with pretty output
+	zerologPrettySetup()
 
 	if err := flagSet.Parse(); err != nil {
 		log.Fatal().Err(err).Msg("Error parsing flags")
@@ -194,7 +249,7 @@ func checkTrivyInstalled() error {
 	log.Info().Msg("Trivy found")
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		if line = strings.TrimSpace(line); line != "" {
-			log.Info().Str("version", line).Send()
+			log.Info().Msg(line)
 		}
 	}
 
