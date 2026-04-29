@@ -63,6 +63,7 @@ type options struct {
 	Input          string
 	Output         string
 	Severity       string
+	Scanner        string
 	Concurrency    int
 	SkipDBUpdate   bool
 	SkipTrivyCheck bool
@@ -419,7 +420,7 @@ func runWithRetry(ctx context.Context, operation string, fn func() error) error 
 }
 
 // processScanWithOutput scans a tar file and writes the HTML report to outputDir
-func processScanWithOutput(ctx context.Context, inputFile, outputDir string) (string, error) {
+func processScanWithOutput(ctx context.Context, inputFile, outputDir, scanner string) (string, error) {
 	scanCtx, cancel := context.WithTimeout(ctx, defaultScanTimeout)
 	defer cancel()
 
@@ -428,16 +429,25 @@ func processScanWithOutput(ctx context.Context, inputFile, outputDir string) (st
 	}
 
 	out := outputFilenameCustom(inputFile, outputDir)
-	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
+	log.Info().Str("file", filepath.Base(inputFile)).Str("scanner", scanner).Msg("Scanning")
 
-	cmd := exec.CommandContext(scanCtx, trivyCmd, trivySubCmd,
+	// Build trivy command args
+	args := []string{
+		trivyCmd, trivySubCmd,
 		"--input", inputFile,
 		"--severity", "MEDIUM,HIGH,CRITICAL",
 		"--format", "template",
 		"--template", templateContent,
 		"--output", out,
 		trivySkipDB, trivySkipJavaDB,
-	)
+	}
+
+	// Only add scanner flag if explicitly specified
+	if scanner != "" {
+		args = append(args, "--scanner", scanner)
+	}
+
+	cmd := exec.CommandContext(scanCtx, args[0], args[1:]...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -593,6 +603,8 @@ func main() {
 	flagSet.CreateGroup("configs", "Configs",
 		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", defaultConcurrency, "number of concurrent scans"),
 		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels"),
+		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanner to use (vuln,misconfig,secret,"+
+			"license)"),
 		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip database update"),
 		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy check"),
 		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "r", defaultMaxRetries, "max retry attempts"),
@@ -663,7 +675,7 @@ func main() {
 
 	pool := NewWorkerPool(ctx, opts.Concurrency, opts.MaxRetries, cb)
 	pool.Start(opts.Concurrency, func(ctx context.Context, file string) (string, error) {
-		return processScanWithOutput(ctx, file, opts.Output)
+		return processScanWithOutput(ctx, file, opts.Output, opts.Scanner)
 	})
 
 	go func() {
