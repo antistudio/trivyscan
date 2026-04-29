@@ -114,10 +114,10 @@ echo ""
 echo "[INFO] Installing TrivyScan..."
 
 # Find the correct binary for this OS/arch inside the zip
-source_bin="$SCRIPT_DIR/trivyscan_${OS_GO}_${ARCH_GO}"
+source_bin="$SCRIPT_DIR/trivyscan_${OS_GO}"
 
 if [ ! -f "$source_bin" ]; then
-    echo "[ERROR] Binary not found: trivyscan_${OS_GO}_${ARCH_GO}"
+    echo "[ERROR] Binary not found: trivyscan_${OS_GO}"
     echo "        Available files in current directory:"
     ls "$SCRIPT_DIR"/trivyscan_* 2>/dev/null || echo "        (none found)"
     exit 1

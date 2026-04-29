@@ -99,11 +99,11 @@ if (Get-Command trivy -ErrorAction SilentlyContinue) {
 Write-Host ""
 Write-Host "[INFO] Installing TrivyScan..."
 
-$SourceExe = Join-Path $ScriptDir "trivyscan_windows_${Arch}.exe"
+$SourceExe = Join-Path $ScriptDir "trivyscan_windows.exe"
 $TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
 
 if (-not (Test-Path $SourceExe)) {
-    Write-Host "[ERROR] Binary not found: trivyscan_windows_${Arch}.exe"
+    Write-Host "[ERROR] Binary not found: trivyscan_windows.exe"
     Write-Host "        Available files:"
     Get-ChildItem "$ScriptDir\trivyscan_*" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "        $_" }
     exit 1

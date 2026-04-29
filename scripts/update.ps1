@@ -108,11 +108,11 @@ if (-not $latestTrivy) {
 Write-Host ""
 Write-Host "[INFO] Updating TrivyScan..."
 
-$SourceExe = Join-Path $ScriptDir "trivyscan_windows_${Arch}.exe"
+$SourceExe = Join-Path $ScriptDir "trivyscan_windows.exe"
 $TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
 
 if (-not (Test-Path $SourceExe)) {
-    Write-Host "[ERROR] Binary not found: trivyscan_windows_${Arch}.exe"
+    Write-Host "[ERROR] Binary not found: trivyscan_windows.exe"
 } else {
     if (-not (Test-Path $TrivyScanDir)) {
         New-Item -ItemType Directory -Path $TrivyScanDir | Out-Null

@@ -114,10 +114,10 @@ fi
 echo ""
 echo "[INFO] Updating TrivyScan..."
 
-source_bin="$SCRIPT_DIR/trivyscan_${OS_GO}_${ARCH_GO}"
+source_bin="$SCRIPT_DIR/trivyscan_${OS_GO}"
 
 if [ ! -f "$source_bin" ]; then
-    echo "[ERROR] Binary not found: trivyscan_${OS_GO}_${ARCH_GO}"
+    echo "[ERROR] Binary not found: trivyscan_${OS_GO}"
 else
     run_privileged cp "$source_bin" "$TRIVYSCAN_INSTALL_DIR/trivyscan"
     run_privileged chmod 755 "$TRIVYSCAN_INSTALL_DIR/trivyscan"
