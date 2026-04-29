@@ -36,39 +36,22 @@ Write-Host "      Trivy + TrivyScan Installer"
 Write-Host "========================================="
 Write-Host "[INFO] OS: Windows | Arch: $Arch"
 
+$trivyUpdated     = $false
+$trivyscanUpdated = $false
+
 # =========================================
-# Step 1: Install Trivy
+# Helper Functions
 # =========================================
-Write-Host ""
-Write-Host "[INFO] Checking Trivy..."
 
-if (Get-Command trivy -ErrorAction SilentlyContinue) {
-    Write-Host "[OK] Trivy already installed - skipping"
-} else {
-    Write-Host "[INFO] Fetching latest Trivy version..."
-    try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/aquasecurity/trivy/releases/latest"
-        $version = $release.tag_name -replace "^v", ""
-    } catch {
-        Write-Host "[ERROR] Cannot fetch Trivy version: $_"
-        exit 1
-    }
-
-    if (-not $version) {
-        Write-Host "[ERROR] Version is empty"
-        exit 1
-    }
-
-    Write-Host "[OK] Latest Trivy version: $version"
-
-    $url = "https://github.com/aquasecurity/trivy/releases/download/v$version/trivy_${version}_Windows-${ArchTrivy}.zip"
+function Install-Trivy($latestVersion) {
+    $url = "https://github.com/aquasecurity/trivy/releases/download/v$latestVersion/trivy_${latestVersion}_Windows-${ArchTrivy}.zip"
 
     Write-Host "[INFO] Downloading from: $url"
     try {
         Invoke-WebRequest -Uri $url -OutFile $TrivyZip
     } catch {
         Write-Host "[ERROR] Download failed: $_"
-        exit 1
+        return $false
     }
 
     Write-Host "[INFO] Extracting..."
@@ -87,40 +70,106 @@ if (Get-Command trivy -ErrorAction SilentlyContinue) {
 
     if (-not (Test-Path "$TrivyDir\trivy.exe")) {
         Write-Host "[ERROR] trivy.exe not found after extraction"
-        exit 1
+        return $false
     }
 
-    Write-Host "[OK] Trivy installed"
+    return $true
+}
+
+function Install-TrivyScan {
+    param(
+        [string]$SourceExe,
+        [string]$TargetExe
+    )
+
+    if (-not (Test-Path $SourceExe)) {
+        Write-Host "[ERROR] Binary not found: $SourceExe"
+        return $false
+    }
+
+    if (-not (Test-Path $TrivyScanDir)) {
+        New-Item -ItemType Directory -Path $TrivyScanDir | Out-Null
+    }
+
+    Copy-Item $SourceExe $TargetExe -Force
+
+    if (-not (Test-Path $TargetExe)) {
+        Write-Host "[ERROR] Failed to install trivyscan"
+        return $false
+    }
+
+    return $true
 }
 
 # =========================================
-# Step 2: Install TrivyScan (detect binary)
+# Step 1: Install/Update Trivy
 # =========================================
 Write-Host ""
-Write-Host "[INFO] Installing TrivyScan..."
+Write-Host "[INFO] Checking Trivy..."
+
+$currentTrivy = $null
+
+# Check if Trivy is already installed
+if (Test-Path "$TrivyDir\trivy.exe") {
+    $currentTrivy = (& "$TrivyDir\trivy.exe" --version 2>$null) -replace ".*?([0-9]+\.[0-9]+\.[0-9]+).*", '$1'
+}
+
+# Get latest version from GitHub
+$latestTrivy = $null
+try {
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/aquasecurity/trivy/releases/latest"
+    $latestTrivy = $release.tag_name -replace "^v", ""
+} catch {
+    Write-Host "[WARN] Cannot fetch Trivy version: $_"
+}
+
+if (-not $latestTrivy) {
+    Write-Host "[WARN] Skipping Trivy installation"
+} elseif ($currentTrivy -and $currentTrivy -eq $latestTrivy) {
+    Write-Host "[OK] Trivy already up to date (v$currentTrivy)"
+} else {
+    if ($currentTrivy) {
+        Write-Host "[INFO] Current version: $currentTrivy, updating to v$latestTrivy..."
+    } else {
+        Write-Host "[INFO] Trivy not found, installing v$latestTrivy..."
+    }
+
+    if (Install-Trivy $latestTrivy) {
+        Write-Host "[OK] Trivy installed/updated to v$latestTrivy"
+        $trivyUpdated = $true
+    }
+}
+
+# =========================================
+# Step 2: Install/Update TrivyScan
+# =========================================
+Write-Host ""
+Write-Host "[INFO] Checking TrivyScan..."
 
 $SourceExe = Join-Path $ScriptDir "trivyscan_windows.exe"
 $TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
 
-if (-not (Test-Path $SourceExe)) {
+$currentTrivyscan = $null
+
+# Check if TrivyScan is already installed
+if (Test-Path $TargetExe) {
+    $currentTrivyscan = (& $TargetExe --version 2>$null) | Select-Object -First 1
+}
+
+if (-not $SourceExe) {
     Write-Host "[ERROR] Binary not found: trivyscan_windows.exe"
     Write-Host "        Available files:"
     Get-ChildItem "$ScriptDir\trivyscan_*" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "        $_" }
-    exit 1
+} elseif ($currentTrivyscan) {
+    Write-Host "[OK] TrivyScan already installed"
+} else {
+    Write-Host "[INFO] TrivyScan not found, installing..."
+
+    if (Install-TrivyScan -SourceExe $SourceExe -TargetExe $TargetExe) {
+        Write-Host "[OK] TrivyScan installed"
+        $trivyscanUpdated = $true
+    }
 }
-
-if (-not (Test-Path $TrivyScanDir)) {
-    New-Item -ItemType Directory -Path $TrivyScanDir | Out-Null
-}
-
-Copy-Item $SourceExe $TargetExe -Force
-
-if (-not (Test-Path $TargetExe)) {
-    Write-Host "[ERROR] Failed to install trivyscan"
-    exit 1
-}
-
-Write-Host "[OK] TrivyScan installed"
 
 # =========================================
 # Step 3: Update PATH
@@ -147,11 +196,28 @@ foreach ($dir in @($TrivyDir, $TrivyScanDir)) {
 Write-Host ""
 Write-Host "[INFO] Verifying..."
 
-& "$TrivyDir\trivy.exe" --version
-& "$TrivyScanDir\trivyscan.exe" --version
+if (Test-Path "$TrivyDir\trivy.exe") {
+    & "$TrivyDir\trivy.exe" --version
+}
 
+if (Test-Path $TargetExe) {
+    & $TargetExe --version
+}
+
+# =========================================
+# Summary
+# =========================================
 Write-Host ""
 Write-Host "========================================="
-Write-Host "[SUCCESS] Installation complete!"
-Write-Host "         Open a new terminal to use."
+if (-not $latestTrivy)         { Write-Host "[--] Trivy     -> skipped (cannot fetch version)" }
+elseif ($trivyUpdated)         { Write-Host "[OK] Trivy     -> installed/updated to v$latestTrivy" }
+else                          { Write-Host "[OK] Trivy     -> already up to date (v$currentTrivy)" }
+
+if (-not $SourceExe)           { Write-Host "[--] TrivyScan -> skipped (binary not found)" }
+elseif ($trivyscanUpdated)     { Write-Host "[OK] TrivyScan -> installed/updated" }
+elseif ($currentTrivyscan)    { Write-Host "[OK] TrivyScan -> already installed" }
+else                          { Write-Host "[--] TrivyScan -> install failed" }
+
+Write-Host "========================================="
+Write-Host " Install complete! Open a new terminal to use."
 Write-Host "========================================="
