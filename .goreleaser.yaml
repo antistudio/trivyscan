@@ -31,7 +31,7 @@ builds:
       - CGO_ENABLED=0
 
 archives:
-  # Linux archives - include install.sh
+  # Linux archives - include install.sh and update.sh
   - id: linux
     format: zip
     name_template: >-
@@ -48,12 +48,15 @@ archives:
       - src: scripts/install.sh
         dst: install.sh
         strip_parent: true
+      - src: scripts/update.sh
+        dst: update.sh
+        strip_parent: true
     rlcp: true
     filter:
       goos:
         - linux
 
-  # macOS archives - include install.sh
+  # macOS archives - include install.sh and update.sh
   - id: darwin
     format: zip
     name_template: >-
@@ -69,12 +72,15 @@ archives:
       - src: scripts/install.sh
         dst: install.sh
         strip_parent: true
+      - src: scripts/update.sh
+        dst: update.sh
+        strip_parent: true
     rlcp: true
     filter:
       goos:
         - darwin
 
-  # Windows archives - include install.ps1
+  # Windows archives - include install.ps1 and update.ps1
   - id: windows
     format: zip
     name_template: >-
@@ -89,6 +95,9 @@ archives:
       - README*
       - src: scripts/install.ps1
         dst: install.ps1
+        strip_parent: true
+      - src: scripts/update.ps1
+        dst: update.ps1
         strip_parent: true
     rlcp: true
     filter:
