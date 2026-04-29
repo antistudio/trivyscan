@@ -3,14 +3,18 @@
 # =========================================
 # Config
 # =========================================
-INSTALL_DIR="/usr/local/bin"
+TRIVY_INSTALL_DIR="/usr/local/bin"
+TRIVYSCAN_INSTALL_DIR="/usr/local/bin"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# =========================================
+# Detect OS + Arch
+# =========================================
 OS=$(uname -s)
 ARCH=$(uname -m)
 
 case "$ARCH" in
-    x86_64)  ARCH_GO="amd64"; ARCH_TRIVY="64bit" ;;
+    x86_64)        ARCH_GO="amd64"; ARCH_TRIVY="64bit" ;;
     aarch64|arm64) ARCH_GO="arm64"; ARCH_TRIVY="ARM64" ;;
     *)
         echo "[ERROR] Unsupported architecture: $ARCH"
@@ -30,6 +34,7 @@ esac
 echo "========================================="
 echo "      Trivy + TrivyScan Updater"
 echo "========================================="
+echo "[INFO] OS: $OS | Arch: $ARCH_GO"
 
 trivy_updated=false
 trivyscan_updated=false
@@ -38,26 +43,9 @@ trivyscan_updated=false
 # Helper
 # =========================================
 run_privileged() {
-    if [ "$(id -u)" -eq 0 ]; then
-        "$@"
-    else
-        sudo "$@"
+    if [ "$(id -u)" -eq 0 ]; then "$@"
+    else sudo "$@"
     fi
-}
-
-fetch_latest_version() {
-    local repo="$1"
-    local version=""
-
-    if command -v curl &>/dev/null; then
-        version=$(curl -s "https://api.github.com/repos/$repo/releases/latest" \
-            | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
-    elif command -v wget &>/dev/null; then
-        version=$(wget -qO- "https://api.github.com/repos/$repo/releases/latest" \
-            | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
-    fi
-
-    echo "$version"
 }
 
 # =========================================
@@ -66,7 +54,13 @@ fetch_latest_version() {
 echo ""
 echo "[INFO] Fetching latest Trivy version..."
 
-latest_trivy=$(fetch_latest_version "aquasecurity/trivy")
+if command -v curl &>/dev/null; then
+    latest_trivy=$(curl -s "https://api.github.com/repos/aquasecurity/trivy/releases/latest" \
+        | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+elif command -v wget &>/dev/null; then
+    latest_trivy=$(wget -qO- "https://api.github.com/repos/aquasecurity/trivy/releases/latest" \
+        | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+fi
 
 if [ -z "$latest_trivy" ]; then
     echo "[WARN] Cannot fetch Trivy version - skipping"
@@ -86,7 +80,7 @@ else
         tmp_archive="/tmp/trivy.tar.gz"
         tmp_dir="/tmp/trivy_extract"
 
-        echo "[INFO] Downloading Trivy from: $url"
+        echo "[INFO] Downloading from: $url"
         if command -v curl &>/dev/null; then
             curl -fsSL "$url" -o "$tmp_archive"
         else
@@ -104,8 +98,8 @@ else
             if [ ! -f "$tmp_dir/trivy" ]; then
                 echo "[ERROR] trivy binary not found after extraction"
             else
-                run_privileged cp "$tmp_dir/trivy" "$INSTALL_DIR/trivy"
-                run_privileged chmod 755 "$INSTALL_DIR/trivy"
+                run_privileged cp "$tmp_dir/trivy" "$TRIVY_INSTALL_DIR/trivy"
+                run_privileged chmod 755 "$TRIVY_INSTALL_DIR/trivy"
                 rm -rf "$tmp_dir"
                 echo "[OK] Trivy updated to v$latest_trivy"
                 trivy_updated=true
@@ -120,15 +114,15 @@ fi
 echo ""
 echo "[INFO] Updating TrivyScan..."
 
-source_bin="$SCRIPT_DIR/trivyscan"
+source_bin="$SCRIPT_DIR/trivyscan_${OS_GO}_${ARCH_GO}"
 
 if [ ! -f "$source_bin" ]; then
-    echo "[ERROR] trivyscan not found next to script"
+    echo "[ERROR] Binary not found: trivyscan_${OS_GO}_${ARCH_GO}"
 else
-    run_privileged cp "$source_bin" "$INSTALL_DIR/trivyscan"
-    run_privileged chmod 755 "$INSTALL_DIR/trivyscan"
+    run_privileged cp "$source_bin" "$TRIVYSCAN_INSTALL_DIR/trivyscan"
+    run_privileged chmod 755 "$TRIVYSCAN_INSTALL_DIR/trivyscan"
 
-    if [ ! -f "$INSTALL_DIR/trivyscan" ]; then
+    if [ ! -f "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
         echo "[ERROR] Failed to update TrivyScan"
     else
         echo "[OK] TrivyScan updated"
@@ -142,7 +136,7 @@ fi
 echo ""
 echo "[INFO] Verifying..."
 
-command -v trivy &>/dev/null    && trivy --version
+command -v trivy    &>/dev/null && trivy --version
 command -v trivyscan &>/dev/null && trivyscan --version
 
 # =========================================

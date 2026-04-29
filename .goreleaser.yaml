@@ -12,7 +12,7 @@ before:
 builds:
   - id: trivyscan
     main: ./main.go
-    binary: trivyscan
+    binary: "trivyscan_{{ .Os }}_{{ .Arch }}"
     goos:
       - linux
       - darwin
@@ -20,8 +20,6 @@ builds:
     goarch:
       - amd64
       - arm64
-    goarm:
-      - v7
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
@@ -31,41 +29,11 @@ builds:
       - CGO_ENABLED=0
 
 archives:
-  # Linux archives - include install.sh and update.sh
-  - id: linux
+  # All-in-one AMD64 archive: contains linux + darwin + windows binaries
+  - id: amd64
     format: zip
-    name_template: >-
-      {{ .ProjectName }}_
-      {{- .Version }}_
-      {{- .Os }}_
-      {{- .Arch }}
-      {{- if .Arm }}v{{ .Arm }}{{ end }}
-    builds:
-      - trivyscan
-    files:
-      - LICENSE*
-      - README*
-      - src: scripts/install.sh
-        dst: install.sh
-        strip_parent: true
-      - src: scripts/update.sh
-        dst: update.sh
-        strip_parent: true
-    rlcp: true
-    filter:
-      goos:
-        - linux
-
-  # macOS archives - include install.sh and update.sh
-  - id: darwin
-    format: zip
-    name_template: >-
-      {{ .ProjectName }}_
-      {{- .Version }}_
-      {{- .Os }}_
-      {{- .Arch }}
-    builds:
-      - trivyscan
+    name_template: "{{ .ProjectName }}_{{ .Version }}_amd64"
+    meta: true
     files:
       - INSTALL*
       - src: scripts/install.sh
@@ -74,33 +42,50 @@ archives:
       - src: scripts/update.sh
         dst: update.sh
         strip_parent: true
-    rlcp: true
-    filter:
-      goos:
-        - darwin
+      - src: scripts/install.ps1
+        dst: install.ps1
+        strip_parent: true
+      - src: scripts/update.ps1
+        dst: update.ps1
+        strip_parent: true
+      - src: "dist/trivyscan_linux_amd64_linux_amd64/trivyscan_linux_amd64"
+        dst: trivyscan_linux_amd64
+        strip_parent: true
+      - src: "dist/trivyscan_darwin_amd64_darwin_amd64/trivyscan_darwin_amd64"
+        dst: trivyscan_darwin_amd64
+        strip_parent: true
+      - src: "dist/trivyscan_windows_amd64_windows_amd64/trivyscan_windows_amd64.exe"
+        dst: trivyscan_windows_amd64.exe
+        strip_parent: true
 
-  # Windows archives - include only .bat files (no PowerShell)
-  - id: windows
+  # All-in-one ARM64 archive: contains linux + darwin + windows binaries
+  - id: arm64
     format: zip
-    name_template: >-
-      {{ .ProjectName }}_
-      {{- .Version }}_
-      {{- .Os }}_
-      {{- .Arch }}
-    builds:
-      - trivyscan
+    name_template: "{{ .ProjectName }}_{{ .Version }}_arm64"
+    meta: true
     files:
       - INSTALL*
-      - src: scripts/install.bat
-        dst: install.bat
+      - src: scripts/install.sh
+        dst: install.sh
         strip_parent: true
-      - src: scripts/update.bat
-        dst: update.bat
+      - src: scripts/update.sh
+        dst: update.sh
         strip_parent: true
-    rlcp: true
-    filter:
-      goos:
-        - windows
+      - src: scripts/install.ps1
+        dst: install.ps1
+        strip_parent: true
+      - src: scripts/update.ps1
+        dst: update.ps1
+        strip_parent: true
+      - src: "dist/trivyscan_linux_arm64_linux_arm64/trivyscan_linux_arm64"
+        dst: trivyscan_linux_arm64
+        strip_parent: true
+      - src: "dist/trivyscan_darwin_arm64_darwin_arm64/trivyscan_darwin_arm64"
+        dst: trivyscan_darwin_arm64
+        strip_parent: true
+      - src: "dist/trivyscan_windows_arm64_windows_arm64/trivyscan_windows_arm64.exe"
+        dst: trivyscan_windows_arm64.exe
+        strip_parent: true
 
 snapshot:
   version_template: "dev"

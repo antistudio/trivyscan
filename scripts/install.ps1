@@ -16,12 +16,18 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 $TrivyDir     = "C:\Program Files\Trivy"
 $TrivyScanDir = "C:\Program Files\TrivyScan"
 $TrivyZip     = "$env:TEMP\trivy.zip"
-$TrivyScanZip = "$env:TEMP\trivyscan.zip"
-$TrivyScanTmp = "$env:TEMP\trivyscan_extract"
+$ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# =========================================
+# Detect Arch
+# =========================================
+$Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
+$ArchTrivy = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "ARM64" } else { "64bit" }
 
 Write-Host "========================================="
 Write-Host "      Trivy + TrivyScan Installer"
 Write-Host "========================================="
+Write-Host "[INFO] OS: Windows | Arch: $Arch"
 
 # =========================================
 # Step 1: Install Trivy
@@ -32,7 +38,6 @@ Write-Host "[INFO] Checking Trivy..."
 if (Get-Command trivy -ErrorAction SilentlyContinue) {
     Write-Host "[OK] Trivy already installed - skipping"
 } else {
-    # Fetch latest version
     Write-Host "[INFO] Fetching latest Trivy version..."
     try {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/aquasecurity/trivy/releases/latest"
@@ -49,11 +54,9 @@ if (Get-Command trivy -ErrorAction SilentlyContinue) {
 
     Write-Host "[OK] Latest Trivy version: $version"
 
-    # Download
-    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "ARM64" } else { "64bit" }
-    $url  = "https://github.com/aquasecurity/trivy/releases/download/v$version/trivy_${version}_Windows-${arch}.zip"
+    $url = "https://github.com/aquasecurity/trivy/releases/download/v$version/trivy_${version}_Windows-${ArchTrivy}.zip"
 
-    Write-Host "[INFO] Downloading Trivy from: $url"
+    Write-Host "[INFO] Downloading from: $url"
     try {
         Invoke-WebRequest -Uri $url -OutFile $TrivyZip
     } catch {
@@ -61,15 +64,7 @@ if (Get-Command trivy -ErrorAction SilentlyContinue) {
         exit 1
     }
 
-    if (-not (Test-Path $TrivyZip)) {
-        Write-Host "[ERROR] File not found after download"
-        exit 1
-    }
-
-    Write-Host "[OK] Downloaded"
-
-    # Extract
-    Write-Host "[INFO] Extracting Trivy..."
+    Write-Host "[INFO] Extracting..."
     if (-not (Test-Path $TrivyDir)) {
         New-Item -ItemType Directory -Path $TrivyDir | Out-Null
     }
@@ -92,16 +87,18 @@ if (Get-Command trivy -ErrorAction SilentlyContinue) {
 }
 
 # =========================================
-# Step 2: Install TrivyScan
+# Step 2: Install TrivyScan (detect binary)
 # =========================================
 Write-Host ""
 Write-Host "[INFO] Installing TrivyScan..."
 
-$SourceExe = Join-Path $PSScriptRoot "trivyscan.exe"
+$SourceExe = Join-Path $ScriptDir "trivyscan_windows_${Arch}.exe"
 $TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
 
 if (-not (Test-Path $SourceExe)) {
-    Write-Host "[ERROR] trivyscan.exe not found next to script"
+    Write-Host "[ERROR] Binary not found: trivyscan_windows_${Arch}.exe"
+    Write-Host "        Available files:"
+    Get-ChildItem "$ScriptDir\trivyscan_*" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "        $_" }
     exit 1
 }
 

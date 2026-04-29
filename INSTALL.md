@@ -8,56 +8,68 @@
 
 ---
 
+## Download
+
+Two archives are available, choose based on your CPU:
+
+| Archive | CPU |
+|---|---|
+| `trivyscan_<version>_amd64.zip` | Intel / AMD (most computers) |
+| `trivyscan_<version>_arm64.zip` | Apple Silicon, ARM servers |
+
+Each archive contains binaries for **all OS** (Linux, macOS, Windows) — the install script detects your OS automatically.
+
+---
+
+## Archive contents
+
+```
+trivyscan_<version>_amd64.zip
+├── trivyscan_linux_amd64       ← Linux binary
+├── trivyscan_darwin_amd64      ← macOS binary
+├── trivyscan_windows_amd64.exe ← Windows binary
+├── install.sh                  ← Linux / macOS installer
+├── install.ps1                 ← Windows installer
+├── update.sh                   ← Linux / macOS updater
+├── update.ps1                  ← Windows updater
+└── INSTALL.md
+```
+
+---
+
 ## Install
 
 ### Linux / macOS
 
 ```bash
+unzip trivyscan_<version>_amd64.zip
 chmod +x install.sh
 ./install.sh
 ```
 
 ### Windows
 
-Double-click `install.ps1`
+```
+Unzip trivyscan_<version>_amd64.zip
+Double-click install.ps1
+```
+
 _(auto-elevates to Administrator)_
 
 ---
 
 ## What it does
 
-1. Checks if Trivy is installed — installs latest version if not
-2. Copies `trivyscan` binary to system directory
+1. Checks if Trivy is installed — fetches and installs latest version if not
+2. Detects OS, copies the correct binary to system directory
 3. Adds both to `PATH`
 4. Verifies installation
 
 ---
 
-## Archive contents
-
-**Linux / macOS**
-```
-trivyscan_<version>_<os>_<arch>.zip
-├── trivyscan       ← binary
-├── install.sh      ← install script
-├── update.sh       ← update script
-└── README.md
-```
-
-**Windows**
-```
-trivyscan_<version>_windows_<arch>.zip
-├── trivyscan.exe   ← binary
-├── install.ps1     ← install script
-├── update.ps1      ← update script
-└── README.md
-```
-
----
-
 ## Install paths
 
-| OS | Trivy | TrivyScan |
+| | Trivy | TrivyScan |
 |---|---|---|
 | Linux / macOS | `/usr/local/bin/trivy` | `/usr/local/bin/trivyscan` |
 | Windows | `C:\Program Files\Trivy\` | `C:\Program Files\TrivyScan\` |
@@ -65,6 +77,8 @@ trivyscan_<version>_windows_<arch>.zip
 ---
 
 ## Update
+
+Download the latest archive, extract, then run the update script. It will fetch the latest Trivy from GitHub and replace the TrivyScan binary from the local file.
 
 ### Linux / macOS
 
@@ -75,9 +89,9 @@ chmod +x update.sh
 
 ### Windows
 
-Double-click `update.ps1`
-
-The update script fetches the latest versions from GitHub, skips if already up to date, and verifies after updating.
+```
+Double-click update.ps1
+```
 
 ---
 

@@ -16,10 +16,18 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 $TrivyDir     = "C:\Program Files\Trivy"
 $TrivyScanDir = "C:\Program Files\TrivyScan"
 $TrivyZip     = "$env:TEMP\trivy.zip"
+$ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# =========================================
+# Detect Arch
+# =========================================
+$Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
+$ArchTrivy = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "ARM64" } else { "64bit" }
 
 Write-Host "========================================="
 Write-Host "      Trivy + TrivyScan Updater"
 Write-Host "========================================="
+Write-Host "[INFO] OS: Windows | Arch: $Arch"
 
 $trivyUpdated     = $false
 $trivyscanUpdated = $false
@@ -34,7 +42,7 @@ try {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/aquasecurity/trivy/releases/latest"
     $latestTrivy = $release.tag_name -replace "^v", ""
 } catch {
-    Write-Host "[ERROR] Cannot fetch Trivy version: $_"
+    Write-Host "[WARN] Cannot fetch Trivy version - skipping: $_"
     $latestTrivy = $null
 }
 
@@ -43,51 +51,46 @@ if (-not $latestTrivy) {
 } else {
     Write-Host "[OK] Latest Trivy version: $latestTrivy"
 
-    # Get current version
     $currentTrivy = $null
     if (Get-Command trivy -ErrorAction SilentlyContinue) {
         $currentTrivy = (trivy --version 2>$null) -replace ".*?([0-9]+\.[0-9]+\.[0-9]+).*", '$1' | Select-Object -First 1
-    }
-
-    if ($currentTrivy) {
         Write-Host "[INFO] Installed version: $currentTrivy"
     }
 
     if ($currentTrivy -eq $latestTrivy) {
         Write-Host "[OK] Trivy is already up to date"
     } else {
-        # Download
-        $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "ARM64" } else { "64bit" }
-        $url  = "https://github.com/aquasecurity/trivy/releases/download/v$latestTrivy/trivy_${latestTrivy}_Windows-${arch}.zip"
+        $url = "https://github.com/aquasecurity/trivy/releases/download/v$latestTrivy/trivy_${latestTrivy}_Windows-${ArchTrivy}.zip"
 
-        Write-Host "[INFO] Downloading Trivy from: $url"
+        Write-Host "[INFO] Downloading from: $url"
         try {
             Invoke-WebRequest -Uri $url -OutFile $TrivyZip
         } catch {
             Write-Host "[ERROR] Download failed: $_"
-            goto trivyDone
+            $latestTrivy = $null
         }
 
-        # Extract
-        Write-Host "[INFO] Extracting..."
-        if (-not (Test-Path $TrivyDir)) {
-            New-Item -ItemType Directory -Path $TrivyDir | Out-Null
-        }
+        if ($latestTrivy -and (Test-Path $TrivyZip)) {
+            Write-Host "[INFO] Extracting..."
+            if (-not (Test-Path $TrivyDir)) {
+                New-Item -ItemType Directory -Path $TrivyDir | Out-Null
+            }
 
-        Expand-Archive -Path $TrivyZip -DestinationPath $TrivyDir -Force
-        Remove-Item $TrivyZip -Force -ErrorAction SilentlyContinue
+            Expand-Archive -Path $TrivyZip -DestinationPath $TrivyDir -Force
+            Remove-Item $TrivyZip -Force -ErrorAction SilentlyContinue
 
-        # Fix nested folder if needed
-        if (Test-Path "$TrivyDir\trivy\trivy.exe") {
-            Move-Item "$TrivyDir\trivy\trivy.exe" "$TrivyDir\trivy.exe" -Force
-            Remove-Item "$TrivyDir\trivy" -Recurse -Force -ErrorAction SilentlyContinue
-        }
+            # Fix nested folder if needed
+            if (Test-Path "$TrivyDir\trivy\trivy.exe") {
+                Move-Item "$TrivyDir\trivy\trivy.exe" "$TrivyDir\trivy.exe" -Force
+                Remove-Item "$TrivyDir\trivy" -Recurse -Force -ErrorAction SilentlyContinue
+            }
 
-        if (-not (Test-Path "$TrivyDir\trivy.exe")) {
-            Write-Host "[ERROR] trivy.exe not found after extraction"
-        } else {
-            Write-Host "[OK] Trivy updated to v$latestTrivy"
-            $trivyUpdated = $true
+            if (-not (Test-Path "$TrivyDir\trivy.exe")) {
+                Write-Host "[ERROR] trivy.exe not found after extraction"
+            } else {
+                Write-Host "[OK] Trivy updated to v$latestTrivy"
+                $trivyUpdated = $true
+            }
         }
     }
 }
@@ -98,11 +101,11 @@ if (-not $latestTrivy) {
 Write-Host ""
 Write-Host "[INFO] Updating TrivyScan..."
 
-$SourceExe = Join-Path $PSScriptRoot "trivyscan.exe"
+$SourceExe = Join-Path $ScriptDir "trivyscan_windows_${Arch}.exe"
 $TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
 
 if (-not (Test-Path $SourceExe)) {
-    Write-Host "[ERROR] trivyscan.exe not found next to script"
+    Write-Host "[ERROR] Binary not found: trivyscan_windows_${Arch}.exe"
 } else {
     if (-not (Test-Path $TrivyScanDir)) {
         New-Item -ItemType Directory -Path $TrivyScanDir | Out-Null
