@@ -870,9 +870,7 @@
       const card = document.getElementById('stat-' + severity.toLowerCase());
       if (card) {
         card.querySelector('.card-value').textContent = stats[severity];
-        if (stats[severity] === 0) {
-          card.style.display = 'none';
-        }
+
       }
     });
 
