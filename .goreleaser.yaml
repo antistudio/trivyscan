@@ -31,7 +31,8 @@ builds:
       - CGO_ENABLED=0
 
 archives:
-  - id: trivyscan
+  # Linux archives - include install.sh
+  - id: linux
     format: zip
     name_template: >-
       {{ .ProjectName }}_
@@ -39,10 +40,60 @@ archives:
       {{- .Os }}_
       {{- .Arch }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
+    builds:
+      - trivyscan
     files:
       - LICENSE*
       - README*
-      - CHANGELOG*
+      - src: scripts/install.sh
+        dst: install.sh
+        strip_parent: true
+    rlcp: true
+    filter:
+      goos:
+        - linux
+
+  # macOS archives - include install.sh
+  - id: darwin
+    format: zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    builds:
+      - trivyscan
+    files:
+      - LICENSE*
+      - README*
+      - src: scripts/install.sh
+        dst: install.sh
+        strip_parent: true
+    rlcp: true
+    filter:
+      goos:
+        - darwin
+
+  # Windows archives - include install.ps1
+  - id: windows
+    format: zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    builds:
+      - trivyscan
+    files:
+      - LICENSE*
+      - README*
+      - src: scripts/install.ps1
+        dst: install.ps1
+        strip_parent: true
+    rlcp: true
+    filter:
+      goos:
+        - windows
 
 snapshot:
   version_template: "dev"
