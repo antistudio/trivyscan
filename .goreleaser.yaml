@@ -80,7 +80,7 @@ archives:
       goos:
         - darwin
 
-  # Windows archives - include install.ps1 and update.ps1
+  # Windows archives - include only .bat files (no PowerShell)
   - id: windows
     format: zip
     name_template: >-
@@ -93,11 +93,11 @@ archives:
     files:
       - LICENSE*
       - README*
-      - src: scripts/install.ps1
-        dst: install.ps1
+      - src: scripts/install.bat
+        dst: install.bat
         strip_parent: true
-      - src: scripts/update.ps1
-        dst: update.ps1
+      - src: scripts/update.bat
+        dst: update.bat
         strip_parent: true
     rlcp: true
     filter:
