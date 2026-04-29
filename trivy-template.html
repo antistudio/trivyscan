@@ -157,26 +157,131 @@
       font-weight: 600;
     }
 
-    .filter-select {
+    /* ══ FILTER TOGGLE BUTTONS ══════════════════════ */
+    .filter-pills {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .filter-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 20px;
+      border: 2px solid transparent;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s, box-shadow 0.15s;
+      user-select: none;
+      opacity: 0.38;
+    }
+
+    .filter-pill.active {
+      opacity: 1;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    }
+
+    .filter-pill:hover {
+      transform: translateY(-1px);
+    }
+
+    .filter-pill:active {
+      transform: translateY(0);
+    }
+
+    .filter-pill.pill-CRITICAL {
+      background: var(--critical-bg);
+      border-color: var(--critical-bd);
+      color: var(--critical);
+    }
+    .filter-pill.pill-CRITICAL.active {
+      background: var(--critical);
+      border-color: var(--critical);
+      color: white;
+    }
+
+    .filter-pill.pill-HIGH {
+      background: var(--high-bg);
+      border-color: var(--high-bd);
+      color: var(--high);
+    }
+    .filter-pill.pill-HIGH.active {
+      background: var(--high);
+      border-color: var(--high);
+      color: white;
+    }
+
+    .filter-pill.pill-MEDIUM {
+      background: var(--medium-bg);
+      border-color: var(--medium-bd);
+      color: var(--medium);
+    }
+    .filter-pill.pill-MEDIUM.active {
+      background: var(--medium);
+      border-color: var(--medium);
+      color: white;
+    }
+
+    .filter-pill.pill-LOW {
+      background: var(--low-bg);
+      border-color: var(--low-bd);
+      color: var(--low);
+    }
+    .filter-pill.pill-LOW.active {
+      background: var(--low);
+      border-color: var(--low);
+      color: white;
+    }
+
+    .filter-pill.pill-UNKNOWN {
+      background: var(--tag);
+      border-color: var(--bd);
+      color: var(--tx2);
+    }
+    .filter-pill.pill-UNKNOWN.active {
+      background: var(--tx2);
+      border-color: var(--tx2);
+      color: white;
+    }
+
+    .pill-count {
+      background: rgba(255,255,255,0.35);
+      border-radius: 10px;
+      padding: 1px 6px;
+      font-size: 11px;
+    }
+    .filter-pill:not(.active) .pill-count {
+      background: rgba(0,0,0,0.08);
+    }
+
+    /* ══ COLLAPSE BUTTONS ══════════════════════════════ */
+    .collapse-btn {
       background: var(--bg2);
       border: 1px solid var(--bd);
       border-radius: var(--r);
-      padding: 6px 30px 6px 10px;
+      padding: 6px 12px;
       font-family: var(--mono);
-      font-size: 14px;
-      color: var(--tx);
+      font-size: 13px;
+      color: var(--tx2);
       cursor: pointer;
-      transition: border-color 0.12s;
-      appearance: none;
-      background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%2358626e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-      background-repeat: no-repeat;
-      background-position: right 10px center;
+      transition: background 0.12s, border-color 0.12s, color 0.12s;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 5px;
     }
 
-    .filter-select:hover,
-    .filter-select:focus {
-      outline: none;
+    .collapse-btn:hover {
+      background: var(--bg3);
       border-color: var(--ac);
+      color: var(--ac);
     }
 
     .hint-text {
@@ -185,7 +290,6 @@
       font-size: 13px;
       color: var(--tx2);
     }
-
     /* ══ SECTION ══════════════════════════════════════ */
     .section {
       background: var(--bg2);
@@ -578,16 +682,34 @@
   <!-- ══ FILTER BAR ═══════════════════════════════════ -->
   <div class="filter-bar">
     <span class="filter-label">Filter:</span>
-    <select id="severityFilter" class="filter-select" onchange="filterBySeverity()">
-      <option value="ALL">All Severities</option>
-      <option value="CRITICAL">Critical</option>
-      <option value="HIGH">High</option>
-      <option value="MEDIUM">Medium</option>
-      <option value="LOW">Low</option>
-    </select>
-    <span class="hint-text">Click headers to collapse/expand</span>
-  </div>
 
+    <div class="filter-pills" id="filterPills">
+      <button class="filter-pill pill-CRITICAL active" data-sev="CRITICAL" onclick="togglePill(this)">
+        CRITICAL <span class="pill-count" id="pill-count-CRITICAL">0</span>
+      </button>
+      <button class="filter-pill pill-HIGH active" data-sev="HIGH" onclick="togglePill(this)">
+        HIGH <span class="pill-count" id="pill-count-HIGH">0</span>
+      </button>
+      <button class="filter-pill pill-MEDIUM active" data-sev="MEDIUM" onclick="togglePill(this)">
+        MEDIUM <span class="pill-count" id="pill-count-MEDIUM">0</span>
+      </button>
+      <button class="filter-pill pill-LOW active" data-sev="LOW" onclick="togglePill(this)">
+        LOW <span class="pill-count" id="pill-count-LOW">0</span>
+      </button>
+      <button class="filter-pill pill-UNKNOWN active" data-sev="UNKNOWN" onclick="togglePill(this)">
+        UNKNOWN <span class="pill-count" id="pill-count-UNKNOWN">0</span>
+      </button>
+    </div>
+
+    <button class="collapse-btn" onclick="collapseAll()" title="Collapse all sections">
+      &#9650; Collapse All
+    </button>
+    <button class="collapse-btn" onclick="expandAll()" title="Expand all sections">
+      &#9660; Expand All
+    </button>
+
+    <span class="hint-text" id="filterHint">Showing all results</span>
+  </div>
   <!-- ══ VULNERABILITY SECTIONS ═══════════════════════ -->
   {{- range . }}
   <div class="section">
@@ -726,6 +848,7 @@
     calculateSectionStats();
     setupLinkToggles();
     setupCollapsibleSections();
+    updatePillCounts();
 
     document.querySelectorAll('tbody').forEach(function(tbody) {
       const rows = Array.from(tbody.querySelectorAll('tr[data-severity]'));
@@ -819,14 +942,54 @@
     });
   }
 
-  function filterBySeverity() {
-    const selected = document.getElementById('severityFilter').value;
+  /* ── Pill filter ─────────────────────────────────── */
+  function togglePill(btn) {
+    btn.classList.toggle('active');
+    applyPillFilter();
+  }
+
+  function applyPillFilter() {
+    const pills = document.querySelectorAll('.filter-pill');
+    const active = Array.from(pills).filter(p => p.classList.contains('active')).map(p => p.dataset.sev);
+
     const rows = document.querySelectorAll('tbody tr[data-severity]');
     rows.forEach(function(row) {
-      const shouldShow = selected === 'ALL' || row.getAttribute('data-severity') === selected;
-      row.style.display = shouldShow ? '' : 'none';
+      row.style.display = active.includes(row.getAttribute('data-severity')) ? '' : 'none';
+    });
+
+    const visible = document.querySelectorAll('tbody tr[data-severity]:not([style*="none"])').length;
+    const hint = document.getElementById('filterHint');
+    if (hint) {
+      hint.textContent = visible === rows.length ? 'Showing all results' : 'Showing ' + visible + ' / ' + rows.length + ' results';
+    }
+  }
+
+  function updatePillCounts() {
+    const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, UNKNOWN: 0 };
+    document.querySelectorAll('tbody tr[data-severity]').forEach(function(row) {
+      const s = row.getAttribute('data-severity');
+      if (counts.hasOwnProperty(s)) counts[s]++;
+    });
+    Object.keys(counts).forEach(function(s) {
+      const el = document.getElementById('pill-count-' + s);
+      if (el) el.textContent = counts[s];
+      // Hide pill entirely if count is 0
+      const pill = document.querySelector('.filter-pill.pill-' + s);
+      if (pill && counts[s] === 0) pill.style.display = 'none';
     });
   }
+
+  /* ── Collapse / Expand All ───────────────────────── */
+  function collapseAll() {
+    document.querySelectorAll('.section').forEach(function(s) { s.classList.add('collapsed'); });
+  }
+
+  function expandAll() {
+    document.querySelectorAll('.section').forEach(function(s) { s.classList.remove('collapsed'); });
+  }
+
+  // Legacy shim
+  function filterBySeverity() {}
 </script>
 
 {{- else }}
