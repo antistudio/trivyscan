@@ -420,7 +420,7 @@ func runWithRetry(ctx context.Context, operation string, fn func() error) error 
 }
 
 // processScanWithOutput scans a tar file and writes the HTML report to outputDir
-func processScanWithOutput(ctx context.Context, inputFile, outputDir, scanner string) (string, error) {
+func processScanWithOutput(ctx context.Context, inputFile, outputDir, severity, scanner string) (string, error) {
 	scanCtx, cancel := context.WithTimeout(ctx, defaultScanTimeout)
 	defer cancel()
 
@@ -435,11 +435,15 @@ func processScanWithOutput(ctx context.Context, inputFile, outputDir, scanner st
 	args := []string{
 		trivyCmd, trivySubCmd,
 		"--input", inputFile,
-		"--severity", "MEDIUM,HIGH,CRITICAL",
 		"--format", "template",
 		"--template", templateContent,
 		"--output", out,
 		trivySkipDB, trivySkipJavaDB,
+	}
+
+	// Only add severity flag if explicitly specified
+	if severity != "" {
+		args = append(args, "--severity", severity)
 	}
 
 	// Only add scanner flag if explicitly specified
@@ -675,7 +679,7 @@ func main() {
 
 	pool := NewWorkerPool(ctx, opts.Concurrency, opts.MaxRetries, cb)
 	pool.Start(opts.Concurrency, func(ctx context.Context, file string) (string, error) {
-		return processScanWithOutput(ctx, file, opts.Output, opts.Scanner)
+		return processScanWithOutput(ctx, file, opts.Output, opts.Severity, opts.Scanner)
 	})
 
 	go func() {
