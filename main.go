@@ -475,7 +475,7 @@ func checkTrivyInstalled(ctx context.Context) error {
 			}
 			return buildTrivyNotFoundError()
 		}
-		log.Info().Msgf("Trivy: %s", strings.TrimSpace(string(output)))
+		log.Info().Msgf("Trivy: %s\n", strings.TrimSpace(string(output)))
 		return nil
 	})
 }
