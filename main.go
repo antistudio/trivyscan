@@ -29,28 +29,6 @@ func zerologPrettySetup() {
 		FormatMessage: func(i interface{}) string {
 			return fmt.Sprintf(" %s", i)
 		},
-		FormatLevel: func(i interface{}) string {
-			var l string
-			if ll, ok := i.(string); ok {
-				switch ll {
-				case "debug":
-					l = "⬡ DBG"
-				case "info":
-					l = "✦ INFO"
-				case "warn":
-					l = "⚠ WARN"
-				case "error":
-					l = "✗ ERROR"
-				case "fatal":
-					l = "✗ FATAL"
-				case "panic":
-					l = "✗ PANIC"
-				default:
-					l = "• " + ll
-				}
-			}
-			return l
-		},
 		FormatCaller: func(i interface{}) string {
 			var s string
 			if c, ok := i.(string); ok {
@@ -246,12 +224,7 @@ func checkTrivyInstalled() error {
 		return buildTrivyNotFoundError()
 	}
 
-	log.Info().Msg("Trivy found")
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			log.Info().Msg(line)
-		}
-	}
+	log.Info().Msgf("Trivy found \n%s", strings.TrimSpace(string(output)))
 
 	return nil
 }
