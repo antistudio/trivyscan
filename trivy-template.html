@@ -657,6 +657,10 @@
 
   <!-- ══ SUMMARY CARDS ════════════════════════════════ -->
   <div class="meta-grid">
+    <div class="card total" id="stat-total">
+      <div class="card-label">Total</div>
+      <div class="card-value">0</div>
+    </div>
     <div class="card critical" id="stat-critical">
       <div class="card-label">Critical</div>
       <div class="card-value">0</div>
@@ -671,10 +675,6 @@
     </div>
     <div class="card low" id="stat-low">
       <div class="card-label">Low</div>
-      <div class="card-value">0</div>
-    </div>
-    <div class="card total" id="stat-total">
-      <div class="card-label">Total</div>
       <div class="card-value">0</div>
     </div>
   </div>
@@ -985,9 +985,6 @@
   function expandAll() {
     document.querySelectorAll('.section').forEach(function(s) { s.classList.remove('collapsed'); });
   }
-
-  // Legacy shim
-  function filterBySeverity() {}
 </script>
 
 {{- else }}
