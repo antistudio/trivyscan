@@ -4,7 +4,7 @@
 # Config
 # =========================================
 INSTALL_DIR="/usr/local/bin"
-TRIVYSCAN_REPO="anhnmt/trivyscan"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 OS=$(uname -s)
 ARCH=$(uname -m)
@@ -115,56 +115,24 @@ else
 fi
 
 # =========================================
-# Step 2: Update TrivyScan
+# Step 2: Update TrivyScan (from local binary)
 # =========================================
 echo ""
-echo "[INFO] Fetching latest TrivyScan version..."
+echo "[INFO] Updating TrivyScan..."
 
-latest_trivyscan=$(fetch_latest_version "$TRIVYSCAN_REPO")
+source_bin="$SCRIPT_DIR/trivyscan"
 
-if [ -z "$latest_trivyscan" ]; then
-    echo "[WARN] Cannot fetch TrivyScan version - skipping"
+if [ ! -f "$source_bin" ]; then
+    echo "[ERROR] trivyscan not found next to script"
 else
-    echo "[OK] Latest TrivyScan version: $latest_trivyscan"
+    run_privileged cp "$source_bin" "$INSTALL_DIR/trivyscan"
+    run_privileged chmod 755 "$INSTALL_DIR/trivyscan"
 
-    current_trivyscan=""
-    if command -v trivyscan &>/dev/null; then
-        current_trivyscan=$(trivyscan --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        echo "[INFO] Installed version: $current_trivyscan"
-    fi
-
-    if [ "$current_trivyscan" = "$latest_trivyscan" ]; then
-        echo "[OK] TrivyScan is already up to date"
+    if [ ! -f "$INSTALL_DIR/trivyscan" ]; then
+        echo "[ERROR] Failed to update TrivyScan"
     else
-        url="https://github.com/$TRIVYSCAN_REPO/releases/download/v${latest_trivyscan}/trivyscan_${latest_trivyscan}_${OS_GO}_${ARCH_GO}.zip"
-        tmp_archive="/tmp/trivyscan.zip"
-        tmp_dir="/tmp/trivyscan_extract"
-
-        echo "[INFO] Downloading TrivyScan from: $url"
-        if command -v curl &>/dev/null; then
-            curl -fsSL "$url" -o "$tmp_archive"
-        else
-            wget -q "$url" -O "$tmp_archive"
-        fi
-
-        if [ ! -f "$tmp_archive" ]; then
-            echo "[ERROR] Download failed"
-        else
-            echo "[INFO] Extracting..."
-            rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
-            unzip -q "$tmp_archive" -d "$tmp_dir"
-            rm -f "$tmp_archive"
-
-            if [ ! -f "$tmp_dir/trivyscan" ]; then
-                echo "[ERROR] trivyscan binary not found after extraction"
-            else
-                run_privileged cp "$tmp_dir/trivyscan" "$INSTALL_DIR/trivyscan"
-                run_privileged chmod 755 "$INSTALL_DIR/trivyscan"
-                rm -rf "$tmp_dir"
-                echo "[OK] TrivyScan updated to v$latest_trivyscan"
-                trivyscan_updated=true
-            fi
-        fi
+        echo "[OK] TrivyScan updated"
+        trivyscan_updated=true
     fi
 fi
 
@@ -185,7 +153,7 @@ echo "========================================="
 if $trivy_updated;     then echo "[OK] Trivy     -> updated to v$latest_trivy"
 else                        echo "[--] Trivy     -> already up to date"
 fi
-if $trivyscan_updated; then echo "[OK] TrivyScan -> updated to v$latest_trivyscan"
-else                        echo "[--] TrivyScan -> already up to date"
+if $trivyscan_updated; then echo "[OK] TrivyScan -> updated"
+else                        echo "[--] TrivyScan -> update failed or skipped"
 fi
 echo "========================================="

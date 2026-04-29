@@ -4,7 +4,6 @@
 # Config
 # =========================================
 INSTALL_DIR="/usr/local/bin"
-TRIVYSCAN_REPO="anhnmt/trivyscan"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 OS=$(uname -s)

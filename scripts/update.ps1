@@ -16,9 +16,6 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 $TrivyDir     = "C:\Program Files\Trivy"
 $TrivyScanDir = "C:\Program Files\TrivyScan"
 $TrivyZip     = "$env:TEMP\trivy.zip"
-$TrivyScanZip = "$env:TEMP\trivyscan.zip"
-$TrivyScanTmp = "$env:TEMP\trivyscan_extract"
-$TrivyScanRepo = "anhnmt/trivyscan"
 
 Write-Host "========================================="
 Write-Host "      Trivy + TrivyScan Updater"
@@ -96,71 +93,28 @@ if (-not $latestTrivy) {
 }
 
 # =========================================
-# Step 2: Update TrivyScan
+# Step 2: Update TrivyScan (from local binary)
 # =========================================
 Write-Host ""
-Write-Host "[INFO] Fetching latest TrivyScan version..."
+Write-Host "[INFO] Updating TrivyScan..."
 
-try {
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$TrivyScanRepo/releases/latest"
-    $latestTrivyScan = $release.tag_name -replace "^v", ""
-} catch {
-    Write-Host "[ERROR] Cannot fetch TrivyScan version: $_"
-    $latestTrivyScan = $null
-}
+$SourceExe = Join-Path $PSScriptRoot "trivyscan.exe"
+$TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
 
-if (-not $latestTrivyScan) {
-    Write-Host "[WARN] Skipping TrivyScan update"
+if (-not (Test-Path $SourceExe)) {
+    Write-Host "[ERROR] trivyscan.exe not found next to script"
 } else {
-    Write-Host "[OK] Latest TrivyScan version: $latestTrivyScan"
-
-    # Get current version
-    $currentTrivyScan = $null
-    if (Get-Command trivyscan -ErrorAction SilentlyContinue) {
-        $currentTrivyScan = (trivyscan --version 2>$null) -replace ".*?([0-9]+\.[0-9]+\.[0-9]+).*", '$1' | Select-Object -First 1
+    if (-not (Test-Path $TrivyScanDir)) {
+        New-Item -ItemType Directory -Path $TrivyScanDir | Out-Null
     }
 
-    if ($currentTrivyScan) {
-        Write-Host "[INFO] Installed version: $currentTrivyScan"
-    }
+    Copy-Item $SourceExe $TargetExe -Force
 
-    if ($currentTrivyScan -eq $latestTrivyScan) {
-        Write-Host "[OK] TrivyScan is already up to date"
+    if (-not (Test-Path $TargetExe)) {
+        Write-Host "[ERROR] Failed to update TrivyScan"
     } else {
-        # Download
-        $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
-        $url  = "https://github.com/$TrivyScanRepo/releases/download/v$latestTrivyScan/trivyscan_${latestTrivyScan}_windows_${arch}.zip"
-
-        Write-Host "[INFO] Downloading TrivyScan from: $url"
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $TrivyScanZip
-        } catch {
-            Write-Host "[ERROR] Download failed: $_"
-            goto trivyscanDone
-        }
-
-        # Extract
-        Write-Host "[INFO] Extracting..."
-        if (Test-Path $TrivyScanTmp) {
-            Remove-Item $TrivyScanTmp -Recurse -Force
-        }
-
-        Expand-Archive -Path $TrivyScanZip -DestinationPath $TrivyScanTmp -Force
-        Remove-Item $TrivyScanZip -Force -ErrorAction SilentlyContinue
-
-        if (-not (Test-Path "$TrivyScanTmp\trivyscan.exe")) {
-            Write-Host "[ERROR] trivyscan.exe not found after extraction"
-        } else {
-            if (-not (Test-Path $TrivyScanDir)) {
-                New-Item -ItemType Directory -Path $TrivyScanDir | Out-Null
-            }
-
-            Copy-Item "$TrivyScanTmp\trivyscan.exe" "$TrivyScanDir\trivyscan.exe" -Force
-            Remove-Item $TrivyScanTmp -Recurse -Force -ErrorAction SilentlyContinue
-
-            Write-Host "[OK] TrivyScan updated to v$latestTrivyScan"
-            $trivyscanUpdated = $true
-        }
+        Write-Host "[OK] TrivyScan updated"
+        $trivyscanUpdated = $true
     }
 }
 
@@ -197,8 +151,8 @@ Write-Host "[INFO] Verifying..."
 # =========================================
 Write-Host ""
 Write-Host "========================================="
-if ($trivyUpdated)     { Write-Host "[OK] Trivy    -> updated to v$latestTrivy" }
-else                   { Write-Host "[--] Trivy    -> already up to date" }
-if ($trivyscanUpdated) { Write-Host "[OK] TrivyScan -> updated to v$latestTrivyScan" }
-else                   { Write-Host "[--] TrivyScan -> already up to date" }
+if ($trivyUpdated)     { Write-Host "[OK] Trivy     -> updated to v$latestTrivy" }
+else                   { Write-Host "[--] Trivy     -> already up to date" }
+if ($trivyscanUpdated) { Write-Host "[OK] TrivyScan -> updated" }
+else                   { Write-Host "[--] TrivyScan -> update failed or skipped" }
 Write-Host "========================================="
