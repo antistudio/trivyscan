@@ -33,7 +33,7 @@ var version = "dev"
 //go:embed trivy-template.html
 var templateContent string
 
-// Constants for Trivy commands and configuration
+// Command constants
 const (
 	trivyCmd            = "trivy"
 	trivySubCmd         = "image"
@@ -42,25 +42,23 @@ const (
 	trivySkipDB         = "--skip-db-update"
 	trivySkipJavaDB     = "--skip-java-db-update"
 	trivyInstallURL     = "https://aquasecurity.github.io/trivy/latest/getting-started/installation/"
-
-	hashLength = 6
-
-	// Retry configuration
-	maxRetries        = 3
-	initialBackoff    = 2 * time.Second
-	maxBackoff        = 30 * time.Second
-	backoffMultiplier = 2.0
-	jitterFactor      = 0.1
-
-	// Circuit breaker configuration
-	circuitBreakerThreshold = 5
-	circuitBreakerTimeout   = 30 * time.Second
-
-	// Scan timeout per file
-	scanTimeout = 10 * time.Minute
+	hashLength          = 6
 )
 
-// Command-line options
+// Default configuration values
+const (
+	defaultMaxRetries        = 3
+	defaultConcurrency       = 3
+	defaultInitialBackoff    = 2 * time.Second
+	defaultMaxBackoff        = 30 * time.Second
+	defaultBackoffMultiplier = 2.0
+	defaultJitterFactor      = 0.1
+	defaultCBThreshold       = 5
+	defaultCBTimeout         = 30 * time.Second
+	defaultScanTimeout       = 10 * time.Minute
+)
+
+// CLI options
 type options struct {
 	Input          string
 	Output         string
@@ -72,7 +70,7 @@ type options struct {
 	MaxRetries     int
 }
 
-// Scan result with timing and retry information
+// Scan result
 type scanResult struct {
 	File       string
 	OutputFile string
@@ -81,10 +79,10 @@ type scanResult struct {
 	RetryCount int
 }
 
-// TrivySemaphore limits concurrent Trivy executions to prevent SQLite database locking
-var TrivySemaphore *Semaphore
+// Global semaphore to prevent Trivy database locking
+var trivySemaphore *Semaphore
 
-// Semaphore implements a counting semaphore with context cancellation support
+// Semaphore is a counting semaphore with context cancellation support
 type Semaphore struct {
 	mu    sync.Mutex
 	cond  *sync.Cond
@@ -92,14 +90,14 @@ type Semaphore struct {
 	max   int
 }
 
-// NewSemaphore creates a new semaphore with the specified maximum concurrent value
+// NewSemaphore creates a new semaphore
 func NewSemaphore(max int) *Semaphore {
 	s := &Semaphore{max: max}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
 
-// Acquire blocks until a semaphore slot is available or context is cancelled
+// Acquire takes a slot from the semaphore
 func (s *Semaphore) Acquire(ctx context.Context) error {
 	s.cond.L.Lock()
 	for s.value >= s.max {
@@ -116,7 +114,7 @@ func (s *Semaphore) Acquire(ctx context.Context) error {
 	return nil
 }
 
-// Release returns a semaphore slot to the pool
+// Release returns a slot to the semaphore
 func (s *Semaphore) Release() {
 	s.cond.L.Lock()
 	s.value--
@@ -124,7 +122,14 @@ func (s *Semaphore) Release() {
 	s.cond.L.Unlock()
 }
 
-// CircuitBreaker prevents cascading failures during transient errors
+// CircuitBreaker states
+const (
+	stateClosed   int32 = 0
+	stateOpen     int32 = 1
+	stateHalfOpen int32 = 2
+)
+
+// CircuitBreaker prevents cascading failures
 type CircuitBreaker struct {
 	mu            sync.RWMutex
 	failures      int32
@@ -135,33 +140,26 @@ type CircuitBreaker struct {
 	onStateChange func(string, string)
 }
 
-// Circuit breaker states
-const (
-	circuitClosed   int32 = 0
-	circuitOpen     int32 = 1
-	circuitHalfOpen int32 = 2
-)
-
-// NewCircuitBreaker creates a new circuit breaker with the specified threshold and timeout
+// NewCircuitBreaker creates a new circuit breaker
 func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
 	cb := &CircuitBreaker{
 		threshold: int32(threshold),
 		timeout:   timeout,
 	}
-	cb.state.Store(circuitClosed)
+	cb.state.Store(stateClosed)
 	return cb
 }
 
-// Allow checks if a request should be allowed through the circuit breaker
+// Allow checks if operation is allowed
 func (cb *CircuitBreaker) Allow() bool {
 	switch cb.state.Load() {
-	case circuitClosed:
+	case stateClosed:
 		return true
-	case circuitOpen:
+	case stateOpen:
 		cb.mu.RLock()
 		if time.Since(cb.lastFailure) > cb.timeout {
 			cb.mu.RUnlock()
-			cb.state.Store(circuitHalfOpen)
+			cb.state.Store(stateHalfOpen)
 			if cb.onStateChange != nil {
 				go cb.onStateChange("open", "half-open")
 			}
@@ -169,17 +167,17 @@ func (cb *CircuitBreaker) Allow() bool {
 		}
 		cb.mu.RUnlock()
 		return false
-	case circuitHalfOpen:
+	case stateHalfOpen:
 		return true
 	default:
 		return false
 	}
 }
 
-// RecordSuccess resets the circuit breaker on successful operation
+// RecordSuccess resets the circuit breaker
 func (cb *CircuitBreaker) RecordSuccess() {
-	if cb.state.Load() == circuitHalfOpen {
-		cb.state.Store(circuitClosed)
+	if cb.state.Load() == stateHalfOpen {
+		cb.state.Store(stateClosed)
 		atomic.StoreInt32(&cb.failures, 0)
 		if cb.onStateChange != nil {
 			go cb.onStateChange("half-open", "closed")
@@ -187,40 +185,174 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	}
 }
 
-// RecordFailure increments the failure counter and may trip the circuit
+// RecordFailure records a failure and may trip the circuit
 func (cb *CircuitBreaker) RecordFailure() {
 	atomic.AddInt32(&cb.failures, 1)
 	cb.mu.Lock()
 	cb.lastFailure = time.Now()
 	cb.mu.Unlock()
 
-	failures := atomic.LoadInt32(&cb.failures)
-	if failures >= cb.threshold && cb.state.Load() != circuitOpen {
-		cb.state.Store(circuitOpen)
+	if atomic.LoadInt32(&cb.failures) >= cb.threshold && cb.state.Load() != stateOpen {
+		cb.state.Store(stateOpen)
 		if cb.onStateChange != nil {
 			go cb.onStateChange("closed", "open")
 		}
 	}
 }
 
-// State returns the current state of the circuit breaker
-func (cb *CircuitBreaker) State() string {
-	switch cb.state.Load() {
-	case circuitClosed:
-		return "closed"
-	case circuitOpen:
-		return "open"
-	case circuitHalfOpen:
-		return "half-open"
-	default:
-		return "unknown"
+// WorkerPool manages a pool of workers for concurrent processing
+type WorkerPool struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	jobs       chan string
+	results    chan scanResult
+	wg         sync.WaitGroup
+	cb         *CircuitBreaker
+	semaphore  *Semaphore
+	maxRetries int
+}
+
+// NewWorkerPool creates a new worker pool
+func NewWorkerPool(ctx context.Context, concurrency, maxRetries int, cb *CircuitBreaker) *WorkerPool {
+	poolCtx, cancel := context.WithCancel(ctx)
+	return &WorkerPool{
+		ctx:        poolCtx,
+		cancel:     cancel,
+		jobs:       make(chan string),
+		results:    make(chan scanResult, concurrency*2),
+		cb:         cb,
+		semaphore:  trivySemaphore,
+		maxRetries: maxRetries,
 	}
 }
 
-// zerologPrettySetup configures zerolog with human-readable console output
+// Start launches worker goroutines
+func (p *WorkerPool) Start(numWorkers int, processFn func(context.Context, string) (string, error)) {
+	for i := 0; i < numWorkers; i++ {
+		p.wg.Add(1)
+		go p.worker(i, processFn)
+	}
+}
+
+// worker is the main worker loop
+func (p *WorkerPool) worker(id int, processFn func(context.Context, string) (string, error)) {
+	defer p.wg.Done()
+
+	for job := range p.jobs {
+		select {
+		case <-p.ctx.Done():
+			p.results <- scanResult{File: job, Error: p.ctx.Err()}
+			continue
+		default:
+		}
+
+		start := time.Now()
+
+		if !p.cb.Allow() {
+			p.results <- scanResult{
+				File:     job,
+				Error:    fmt.Errorf("circuit breaker open"),
+				Duration: time.Since(start),
+			}
+			continue
+		}
+
+		out, err := p.runWithRetry(job, processFn)
+
+		if err != nil {
+			p.cb.RecordFailure()
+		} else {
+			p.cb.RecordSuccess()
+		}
+
+		p.results <- scanResult{
+			File:       job,
+			OutputFile: out,
+			Error:      err,
+			Duration:   time.Since(start),
+		}
+	}
+}
+
+// runWithRetry executes with retry logic
+func (p *WorkerPool) runWithRetry(job string, processFn func(context.Context, string) (string, error)) (string, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= p.maxRetries; attempt++ {
+		select {
+		case <-p.ctx.Done():
+			return "", p.ctx.Err()
+		default:
+		}
+
+		// Acquire semaphore to prevent Trivy DB lock
+		if err := p.semaphore.Acquire(p.ctx); err != nil {
+			return "", fmt.Errorf("semaphore acquire failed: %w", err)
+		}
+
+		out, err := processFn(p.ctx, job)
+		p.semaphore.Release()
+
+		if err == nil {
+			return out, nil
+		}
+
+		lastErr = err
+
+		if !isRetryableError(err) || attempt >= p.maxRetries {
+			return "", err
+		}
+
+		backoff := calculateBackoff(attempt)
+		log.Warn().
+			Str("file", filepath.Base(job)).
+			Int("attempt", attempt+1).
+			Dur("backoff", backoff).
+			Err(err).
+			Msg("Retry")
+
+		select {
+		case <-p.ctx.Done():
+			return "", p.ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	return "", fmt.Errorf("failed after %d attempts: %w", p.maxRetries+1, lastErr)
+}
+
+// Submit adds a job to the pool
+func (p *WorkerPool) Submit(job string) {
+	p.jobs <- job
+}
+
+// SubmitBatch adds multiple jobs to the pool
+func (p *WorkerPool) SubmitBatch(jobs []string) {
+	for _, j := range jobs {
+		p.Submit(j)
+	}
+}
+
+// Close closes the job channel and waits for completion
+func (p *WorkerPool) Close() {
+	close(p.jobs)
+	p.wg.Wait()
+	close(p.results)
+}
+
+// Results returns the results channel
+func (p *WorkerPool) Results() <-chan scanResult {
+	return p.results
+}
+
+// Cancel cancels all workers
+func (p *WorkerPool) Cancel() {
+	p.cancel()
+}
+
+// zerologPrettySetup configures zerolog console output
 func zerologPrettySetup() {
 	zerolog.TimeFieldFormat = time.RFC3339
-
 	output := zerolog.ConsoleWriter{
 		Out:        os.Stderr,
 		TimeFormat: time.RFC3339,
@@ -243,67 +375,44 @@ func zerologPrettySetup() {
 			return s
 		},
 	}
-
-	log.Logger = zerolog.New(output).
-		With().
-		Timestamp().
-		Caller().
-		Logger()
+	log.Logger = zerolog.New(output).With().Timestamp().Caller().Logger()
 }
 
-// calculateBackoff computes exponential backoff with jitter to prevent thundering herd
+// calculateBackoff computes exponential backoff with jitter
 func calculateBackoff(attempt int) time.Duration {
-	backoff := float64(initialBackoff) * math.Pow(backoffMultiplier, float64(attempt))
-	if backoff > float64(maxBackoff) {
-		backoff = float64(maxBackoff)
+	backoff := float64(defaultInitialBackoff) * math.Pow(defaultBackoffMultiplier, float64(attempt))
+	if backoff > float64(defaultMaxBackoff) {
+		backoff = float64(defaultMaxBackoff)
 	}
-
-	// Add jitter to prevent synchronized retries
-	jitter := backoff * jitterFactor * (2*math.Max(0, math.Min(1, float64(time.Now().UnixNano()%1000)/1000.0)) - 1)
-	backoff += jitter
-
-	return time.Duration(backoff)
+	jitter := backoff * defaultJitterFactor * (2*math.Max(0, math.Min(1, float64(time.Now().UnixNano()%1000)/1000.0)) - 1)
+	return time.Duration(backoff + jitter)
 }
 
-// isRetryableError determines if an error warrants a retry attempt
+// isRetryableError checks if error warrants retry
 func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-
 	errStr := strings.ToLower(err.Error())
-
-	// Patterns indicating transient failures that may succeed on retry
 	retryablePatterns := []string{
-		"context deadline exceeded",
-		"context canceled",
-		"connection refused",
-		"connection reset",
-		"temporary failure",
-		"timeout",
-		"i/o timeout",
-		"no such host",
-		"network",
-		"connection",
-		"database is locked",
-		"database locked",
-		"sqlalchemy",
-		"sqlite_busy",
-		"sqlite_locked",
+		"context deadline exceeded", "context canceled",
+		"connection refused", "connection reset",
+		"temporary failure", "timeout", "i/o timeout",
+		"no such host", "network", "connection",
+		"database is locked", "database locked",
+		"sqlite_busy", "sqlite_locked",
 	}
-
-	for _, pattern := range retryablePatterns {
-		if strings.Contains(errStr, pattern) {
+	for _, p := range retryablePatterns {
+		if strings.Contains(errStr, p) {
 			return true
 		}
 	}
-
 	return false
 }
 
-// runWithRetry executes an operation with exponential backoff retry logic
+// runWithRetry executes operation with retry
 func runWithRetry(ctx context.Context, operation string, fn func() error) error {
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt <= defaultMaxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
@@ -314,19 +423,17 @@ func runWithRetry(ctx context.Context, operation string, fn func() error) error 
 		if err == nil {
 			return nil
 		}
-
-		if attempt >= maxRetries || !isRetryableError(err) {
+		if attempt >= defaultMaxRetries || !isRetryableError(err) {
 			return err
 		}
 
 		backoff := calculateBackoff(attempt)
 		log.Warn().
 			Int("attempt", attempt+1).
-			Int("max_attempts", maxRetries+1).
 			Dur("backoff", backoff).
 			Str("operation", operation).
 			Err(err).
-			Msg("Operation failed, will retry")
+			Msg("Retry failed, will retry")
 
 		select {
 		case <-ctx.Done():
@@ -334,11 +441,42 @@ func runWithRetry(ctx context.Context, operation string, fn func() error) error 
 		case <-time.After(backoff):
 		}
 	}
-
-	return fmt.Errorf("%s failed after %d attempts", operation, maxRetries+1)
+	return fmt.Errorf("%s failed", operation)
 }
 
-// main is the entry point for the TrivyScan application
+// processScan is the scan function passed to worker pool
+func processScan(ctx context.Context, inputFile string) (string, error) {
+	scanCtx, cancel := context.WithTimeout(ctx, defaultScanTimeout)
+	defer cancel()
+
+	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
+		return "", fmt.Errorf("file not found: %s", inputFile)
+	}
+
+	out := outputFilename(inputFile)
+	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
+
+	cmd := exec.CommandContext(scanCtx, trivyCmd, trivySubCmd,
+		"--input", inputFile,
+		"--severity", "MEDIUM,HIGH,CRITICAL",
+		"--format", "template",
+		"--template", templateContent,
+		"--output", out,
+		trivySkipDB, trivySkipJavaDB,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if scanCtx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("scan timeout: %w", err)
+		}
+		return "", fmt.Errorf("trivy failed: %w\n%s", err, output)
+	}
+
+	return out, nil
+}
+
+// main entry point
 func main() {
 	opts := options{}
 
@@ -346,29 +484,26 @@ func main() {
 	flagSet.SetDescription("TrivyScan - Scan container images using Trivy")
 
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar file or directory of .tar files (required)"),
+		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar file or directory (required)"),
 	)
-
 	flagSet.CreateGroup("output", "Output",
 		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory for HTML reports"),
 	)
-
 	flagSet.CreateGroup("configs", "Configs",
-		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", 3, "number of concurrent scans"),
-		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels to report"),
-		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip trivy database update"),
-		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy installation check"),
-		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "r", maxRetries, "maximum number of retry attempts per scan"),
+		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", defaultConcurrency, "number of concurrent scans"),
+		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels"),
+		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip database update"),
+		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy check"),
+		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "r", defaultMaxRetries, "max retry attempts"),
 	)
-
 	flagSet.CreateGroup("info", "Info",
-		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version information"),
+		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version"),
 	)
 
 	zerologPrettySetup()
 
 	if err := flagSet.Parse(); err != nil {
-		log.Fatal().Err(err).Msg("Error parsing flags")
+		log.Fatal().Err(err).Msg("Flag parse error")
 	}
 
 	if opts.Version {
@@ -377,124 +512,156 @@ func main() {
 	}
 
 	if opts.Input == "" {
-		log.Fatal().Msg("Input is required. Usage: -i file.tar OR -i ./directory")
+		log.Fatal().Msg("Input required: -i file.tar OR -i ./directory")
 	}
 
-	// Create cancellable context for graceful shutdown
+	// Setup context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-
 	go func() {
 		sig := <-sigChan
-		log.Warn().Str("signal", sig.String()).Msg("Received shutdown signal, cancelling operations...")
+		log.Warn().Str("signal", sig.String()).Msg("Shutdown signal received")
 		cancel()
 	}()
 
-	// Verify Trivy installation
+	// Check Trivy installation
 	if !opts.SkipTrivyCheck {
 		if err := checkTrivyInstalled(ctx); err != nil {
 			log.Fatal().Err(err).Msg("Trivy check failed")
 		}
 	}
 
-	// Collect input files
+	// Collect files
 	files, err := collectFiles(opts.Input)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error collecting files")
 	}
 	if len(files) == 0 {
-		log.Fatal().Msgf("No .tar files found in: %s", opts.Input)
+		log.Fatal().Msgf("No .tar files in: %s", opts.Input)
 	}
 
 	log.Info().Str("version", version).Msg("TRIVY SCANNER")
 	log.Info().Msg("Starting scan")
 
-	// Update Trivy database
+	// Update database
 	if !opts.SkipDBUpdate {
 		if err := updateTrivyDB(ctx); err != nil {
-			log.Warn().Err(err).Msg("Failed to update trivy database, continuing with existing database")
+			log.Warn().Err(err).Msg("DB update failed, continuing")
 		}
 	}
 
 	// Create output directory
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
-		log.Fatal().Err(err).Msg("Error creating output directory")
+		log.Fatal().Err(err).Msg("Output dir error")
 	}
 
-	// Initialize semaphore to prevent Trivy database lock (SQLite write contention)
-	TrivySemaphore = NewSemaphore(opts.Concurrency)
-	log.Info().Int("trivy_limit", opts.Concurrency).Msg("Trivy semaphore initialized (prevents database lock)")
+	// Initialize semaphore to prevent Trivy DB lock
+	trivySemaphore = NewSemaphore(opts.Concurrency)
+	log.Info().Int("limit", opts.Concurrency).Msg("Semaphore initialized")
 
-	log.Info().Int("workers", opts.Concurrency).Int("total_files", len(files)).Msg("Starting scan...")
+	// Create circuit breaker
+	cb := NewCircuitBreaker(defaultCBThreshold, defaultCBTimeout)
+	cb.onStateChange = func(from, to string) {
+		log.Warn().Str("from", from).Str("to", to).Msg("Circuit breaker")
+	}
 
-	// Run concurrent scans
+	log.Info().Int("workers", opts.Concurrency).Int("files", len(files)).Msg("Starting scan...")
+
+	// Create and start worker pool
+	pool := NewWorkerPool(ctx, opts.Concurrency, opts.MaxRetries, cb)
+	pool.Start(opts.Concurrency, func(ctx context.Context, file string) (string, error) {
+		return processScanWithOutput(ctx, file, opts.Output)
+	})
+
+	// Submit all files
+	go func() {
+		pool.SubmitBatch(files)
+		pool.Close()
+	}()
+
+	// Collect results
 	startTime := time.Now()
-	results := scanFilesAsync(ctx, files, opts.Output, opts.Severity, opts.Concurrency, opts.MaxRetries)
-
 	var successResults, failResults []scanResult
-	var completedCount int32
+	var completed int32
 
-	for result := range results {
-		atomic.AddInt32(&completedCount, 1)
+	for result := range pool.Results() {
+		atomic.AddInt32(&completed, 1)
 		if result.Error != nil {
 			failResults = append(failResults, result)
 		} else {
 			successResults = append(successResults, result)
 		}
-		log.Info().
-			Int("completed", int(atomic.LoadInt32(&completedCount))).
-			Int("total", len(files)).
-			Msg("Progress")
+		// Log progress every 5 files or on completion
+		c := int(atomic.LoadInt32(&completed))
+		if c%5 == 0 || c == len(files) {
+			log.Info().Int("done", c).Int("total", len(files)).Msg("Progress")
+		}
 	}
 
 	elapsed := time.Since(startTime)
 
 	log.Info().Msg("SCAN SUMMARY")
 
-	if len(successResults) > 0 {
-		log.Info().Int("count", len(successResults)).Msg("Successful scans")
-		for _, r := range successResults {
-			log.Info().
-				Str("input", r.File).
-				Str("output", r.OutputFile).
-				Dur("duration", r.Duration.Round(time.Millisecond)).
-				Int("retries", r.RetryCount).
-				Msg("Success")
-		}
+	for _, r := range successResults {
+		log.Info().Str("input", r.File).Str("output", r.OutputFile).Dur("duration", r.Duration).Msg("Success")
 	}
 
-	if len(failResults) > 0 {
-		log.Error().Int("count", len(failResults)).Msg("Failed scans")
-		for _, r := range failResults {
-			log.Error().
-				Str("input", r.File).
-				Str("error", r.Error.Error()).
-				Int("retries", r.RetryCount).
-				Msg("Failed")
-		}
+	for _, r := range failResults {
+		log.Error().Str("input", r.File).Err(r.Error).Msg("Failed")
 	}
 
 	log.Info().
-		Dur("total_duration", elapsed.Round(time.Second)).
+		Dur("duration", elapsed).
 		Int("success", len(successResults)).
 		Int("failed", len(failResults)).
 		Int("total", len(files)).
-		Msg("Scan complete")
+		Msg("Complete")
 
 	if len(failResults) > 0 {
 		os.Exit(1)
 	}
 }
 
-// checkTrivyInstalled verifies that Trivy is installed and accessible
-func checkTrivyInstalled(ctx context.Context) error {
-	log.Info().Msg("Checking trivy installation...")
+// processScanWithOutput processes a scan with custom output directory
+func processScanWithOutput(ctx context.Context, inputFile, outputDir string) (string, error) {
+	scanCtx, cancel := context.WithTimeout(ctx, defaultScanTimeout)
+	defer cancel()
 
-	return runWithRetry(ctx, "trivy version check", func() error {
+	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
+		return "", fmt.Errorf("file not found: %s", inputFile)
+	}
+
+	out := outputFilenameCustom(inputFile, outputDir)
+	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
+
+	cmd := exec.CommandContext(scanCtx, trivyCmd, trivySubCmd,
+		"--input", inputFile,
+		"--severity", "MEDIUM,HIGH,CRITICAL",
+		"--format", "template",
+		"--template", templateContent,
+		"--output", out,
+		trivySkipDB, trivySkipJavaDB,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if scanCtx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("scan timeout: %w", err)
+		}
+		return "", fmt.Errorf("trivy failed: %w\n%s", err, output)
+	}
+
+	return out, nil
+}
+
+// checkTrivyInstalled verifies Trivy is installed
+func checkTrivyInstalled(ctx context.Context) error {
+	log.Info().Msg("Checking Trivy...")
+	return runWithRetry(ctx, "trivy version", func() error {
 		output, err := exec.CommandContext(ctx, trivyCmd, "--version").CombinedOutput()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -502,34 +669,26 @@ func checkTrivyInstalled(ctx context.Context) error {
 			}
 			return buildTrivyNotFoundError()
 		}
-
-		log.Info().Msgf("Trivy found \n%s", strings.TrimSpace(string(output)))
+		log.Info().Msgf("Trivy: %s", strings.TrimSpace(string(output)))
 		return nil
 	})
 }
 
-// buildTrivyNotFoundError creates a descriptive error message with installation instructions
+// buildTrivyNotFoundError creates installation instructions
 func buildTrivyNotFoundError() error {
 	var sb strings.Builder
-
-	sb.WriteString("Trivy is not installed or not in PATH.\n\n")
-
+	sb.WriteString("Trivy not found in PATH.\n\n")
 	switch runtime.GOOS {
 	case "windows":
-		sb.WriteString("  To install, run the bundled script:\n")
-		sb.WriteString("    install.ps1\n\n")
+		sb.WriteString("  Run: install.ps1\n\n")
 	case "linux", "darwin":
-		sb.WriteString("  To install, run the bundled script:\n")
-		sb.WriteString("    chmod +x install.sh && ./install.sh\n\n")
+		sb.WriteString("  Run: chmod +x install.sh && ./install.sh\n\n")
 	}
-
-	sb.WriteString("  Or install manually:\n")
-	sb.WriteString("    " + trivyInstallURL)
-
+	sb.WriteString("  Or: " + trivyInstallURL)
 	return errors.New(sb.String())
 }
 
-// collectFiles gathers all .tar files from the specified input path
+// collectFiles gathers .tar files from input path
 func collectFiles(input string) ([]string, error) {
 	info, err := os.Stat(input)
 	if err != nil {
@@ -538,22 +697,19 @@ func collectFiles(input string) ([]string, error) {
 
 	if !info.IsDir() {
 		if !strings.HasSuffix(strings.ToLower(input), ".tar") {
-			return nil, fmt.Errorf("file '%s' is not a .tar file", input)
+			return nil, fmt.Errorf("not a .tar file: %s", input)
 		}
 		return []string{input}, nil
 	}
 
 	entries, err := os.ReadDir(input)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read directory '%s': %w", input, err)
+		return nil, fmt.Errorf("cannot read directory: %w", err)
 	}
 
 	var files []string
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if strings.HasSuffix(strings.ToLower(entry.Name()), ".tar") {
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".tar") {
 			files = append(files, filepath.Join(input, entry.Name()))
 		}
 	}
@@ -562,7 +718,7 @@ func collectFiles(input string) ([]string, error) {
 	return files, nil
 }
 
-// updateTrivyDB downloads and updates the Trivy vulnerability and Java databases
+// updateTrivyDB updates Trivy databases
 func updateTrivyDB(ctx context.Context) error {
 	databases := []struct {
 		name string
@@ -572,7 +728,7 @@ func updateTrivyDB(ctx context.Context) error {
 		{"Java", trivyDownloadJavaDB},
 	}
 
-	log.Info().Msg("Updating trivy databases...")
+	log.Info().Msg("Updating databases...")
 
 	for _, db := range databases {
 		select {
@@ -581,227 +737,55 @@ func updateTrivyDB(ctx context.Context) error {
 		default:
 		}
 
-		dbName := db.name
-		dbFlag := db.flag
-
-		err := runWithRetry(ctx, "trivy database update", func() error {
-			cmd := exec.CommandContext(ctx, trivyCmd, trivySubCmd, dbFlag)
+		err := runWithRetry(ctx, "db update", func() error {
+			cmd := exec.CommandContext(ctx, trivyCmd, trivySubCmd, db.flag)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				return fmt.Errorf("failed to update %s database: %w\nOutput: %s", dbName, err, output)
+				return fmt.Errorf("%s db failed: %w\n%s", db.name, err, output)
 			}
 			return nil
 		})
 
 		if err != nil {
-			log.Error().Str("database", dbName).Err(err).Msg("Failed to update database")
-			return fmt.Errorf("failed to update %s database: %w", dbName, err)
+			log.Error().Str("database", db.name).Err(err).Msg("Update failed")
+			return err
 		}
-		log.Info().Str("database", dbName).Msg("Updated")
+		log.Info().Str("database", db.name).Msg("Updated")
 	}
-
 	return nil
 }
 
-// fileHash computes the SHA-256 hash of a file and returns the first hashLength characters
+// fileHash computes SHA-256 hash of file
 func fileHash(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to open file: %w", err)
+		return "", err
 	}
 	defer f.Close()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", fmt.Errorf("failed to hash file: %w", err)
+		return "", err
 	}
 
-	full := hex.EncodeToString(h.Sum(nil))
-	if len(full) < hashLength {
-		return full, nil
+	hash := hex.EncodeToString(h.Sum(nil))
+	if len(hash) < hashLength {
+		return hash, nil
 	}
-	return full[:hashLength], nil
+	return hash[:hashLength], nil
 }
 
-// outputFilename generates the output filename for a scan report
-func outputFilename(inputFile, outputDir string) string {
+// outputFilename generates output filename
+func outputFilename(inputFile string) string {
+	return outputFilenameCustom(inputFile, ".")
+}
+
+// outputFilenameCustom generates output filename with custom directory
+func outputFilenameCustom(inputFile, outputDir string) string {
 	hash, err := fileHash(inputFile)
 	if err != nil {
 		hash = fmt.Sprintf("%x", time.Now().Unix())[:hashLength]
 	}
-
 	base := strings.TrimSuffix(filepath.Base(inputFile), filepath.Ext(inputFile))
 	return filepath.Join(outputDir, fmt.Sprintf("%s_%s-report.html", base, hash))
-}
-
-// scanFilesAsync runs scans concurrently using a worker pool pattern
-func scanFilesAsync(ctx context.Context, files []string, outputDir, severity string, concurrency int, maxRetries int) <-chan scanResult {
-	results := make(chan scanResult, len(files))
-	jobs := make(chan string, len(files))
-
-	// Circuit breaker for handling cascading failures
-	cb := NewCircuitBreaker(circuitBreakerThreshold, circuitBreakerTimeout)
-	cb.onStateChange = func(from, to string) {
-		log.Warn().Str("from", from).Str("to", to).Msg("Circuit breaker state changed")
-	}
-
-	var wg sync.WaitGroup
-
-	// Start worker goroutines
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for file := range jobs {
-				select {
-				case <-ctx.Done():
-					results <- scanResult{
-						File:       file,
-						Error:      ctx.Err(),
-						Duration:   0,
-						RetryCount: 0,
-					}
-					continue
-				default:
-				}
-
-				start := time.Now()
-
-				if !cb.Allow() {
-					results <- scanResult{
-						File:     file,
-						Error:    fmt.Errorf("circuit breaker is open, skipping scan"),
-						Duration: time.Since(start),
-					}
-					continue
-				}
-
-				out, err := scanFileWithRetry(ctx, file, outputDir, severity, maxRetries)
-
-				if err != nil {
-					cb.RecordFailure()
-				} else {
-					cb.RecordSuccess()
-				}
-
-				results <- scanResult{
-					File:       file,
-					OutputFile: out,
-					Error:      err,
-					Duration:   time.Since(start),
-				}
-			}
-		}(i)
-	}
-
-	// Feed jobs to workers
-	go func() {
-		for _, f := range files {
-			jobs <- f
-		}
-		close(jobs)
-	}()
-
-	// Close results channel when all workers complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	return results
-}
-
-// scanFileWithRetry executes a Trivy scan with retry logic and semaphore-based concurrency control
-func scanFileWithRetry(ctx context.Context, inputFile, outputDir, severity string, maxRetries int) (string, error) {
-	var lastErr error
-	var outputFile string
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-		}
-
-		// Acquire semaphore to serialize Trivy executions (prevents SQLite lock)
-		if err := TrivySemaphore.Acquire(ctx); err != nil {
-			return "", fmt.Errorf("failed to acquire semaphore: %w", err)
-		}
-
-		out, err := scanFileWithTimeout(ctx, inputFile, outputDir, severity)
-
-		// Always release semaphore
-		TrivySemaphore.Release()
-
-		if err == nil {
-			return out, nil
-		}
-
-		lastErr = err
-
-		if !isRetryableError(err) {
-			return "", err
-		}
-
-		if attempt >= maxRetries {
-			break
-		}
-
-		backoff := calculateBackoff(attempt)
-		log.Warn().
-			Str("file", filepath.Base(inputFile)).
-			Int("attempt", attempt+1).
-			Int("max_attempts", maxRetries+1).
-			Dur("backoff", backoff).
-			Err(err).
-			Msg("Scan failed, will retry")
-
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(backoff):
-		}
-	}
-
-	return outputFile, fmt.Errorf("scan failed after %d attempts: %w", maxRetries+1, lastErr)
-}
-
-// scanFileWithTimeout executes a Trivy scan with a configurable timeout
-func scanFileWithTimeout(ctx context.Context, inputFile, outputDir, severity string) (string, error) {
-	scanCtx, cancel := context.WithTimeout(ctx, scanTimeout)
-	defer cancel()
-
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
-		return "", fmt.Errorf("file does not exist: %s", inputFile)
-	}
-
-	out := outputFilename(inputFile, outputDir)
-
-	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
-
-	cmd := exec.CommandContext(scanCtx, trivyCmd, trivySubCmd,
-		"--input", inputFile,
-		"--severity", severity,
-		"--format", "template",
-		"--template", templateContent,
-		"--output", out,
-		trivySkipDB,
-		trivySkipJavaDB,
-	)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		if scanCtx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("scan timed out after %v: %w", scanTimeout, err)
-		}
-		if scanCtx.Err() != nil {
-			return "", scanCtx.Err()
-		}
-		return "", fmt.Errorf("trivy command failed: %w\nOutput: %s", err, output)
-	}
-
-	return out, nil
 }
