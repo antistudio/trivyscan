@@ -32,6 +32,9 @@ trivyscan -i nginx.tar -o ./reports
 # Scan multiple images
 trivyscan -i image1.tar,image2.tar,image3.tar -o ./reports
 
+# Scan folder (all .tar files)
+trivyscan -i ./images -o ./reports
+
 # Custom configuration
 trivyscan -i app.tar -o ./reports -c 5 -s CRITICAL,HIGH
 ```
@@ -46,7 +49,7 @@ trivyscan [flags]
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `--input` | `-i` | Input image file(s) (comma-separated) | *required* |
+| `--input` | `-i` | Input image file, comma-separated files, or directory | *required* |
 | `--output` | `-o` | Output directory for reports | `.` |
 | `--concurrency` | `-c` | Number of concurrent workers | `3` |
 | `--severity` | `-s` | Severity levels to scan | `MEDIUM,HIGH,CRITICAL` |
@@ -71,6 +74,12 @@ trivyscan -i production.tar -o ./reports -s CRITICAL,HIGH
 
 ```bash
 trivyscan -i *.tar -o ./reports -c 10
+```
+
+### Scan Folder (all .tar files)
+
+```bash
+trivyscan -i ./images -o ./reports
 ```
 
 ### CI/CD (Skip DB Update)
