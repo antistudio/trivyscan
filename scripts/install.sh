@@ -11,11 +11,52 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Args
 # =========================================
 FORCE=false
+UNINSTALL=false
 for arg in "$@"; do
     case "$arg" in
         --force|-f) FORCE=true ;;
+        --uninstall|-u) UNINSTALL=true ;;
+        --help|-h) 
+            echo "Usage: ./install.sh [OPTIONS]"
+            echo "  --force, -f     Force reinstall"
+            echo "  --uninstall, -u Uninstall both"
+            echo "  --help, -h      Show this help"
+            exit 0
+            ;;
     esac
 done
+
+# =========================================
+# Helper
+# =========================================
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"
+    else sudo "$@"
+    fi
+}
+
+# =========================================
+# Uninstall
+# =========================================
+if [ "$UNINSTALL" = true ]; then
+    echo ""
+    echo "[INFO] Uninstalling..."
+
+    # Remove binaries
+    if [ -f "$TRIVY_INSTALL_DIR/trivy" ]; then
+        run_privileged rm -f "$TRIVY_INSTALL_DIR/trivy"
+        echo "[OK] Removed $TRIVY_INSTALL_DIR/trivy"
+    fi
+
+    if [ -f "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
+        run_privileged rm -f "$TRIVYSCAN_INSTALL_DIR/trivyscan"
+        echo "[OK] Removed $TRIVYSCAN_INSTALL_DIR/trivyscan"
+    fi
+
+    echo ""
+    echo "[SUCCESS] Uninstall complete! Restart your terminal."
+    exit 0
+fi
 
 # =========================================
 # Detect OS + Arch
@@ -48,15 +89,6 @@ echo "[INFO] OS: $OS | Arch: $ARCH_GO"
 
 trivy_updated=false
 trivyscan_updated=false
-
-# =========================================
-# Helper
-# =========================================
-run_privileged() {
-    if [ "$(id -u)" -eq 0 ]; then "$@"
-    else sudo "$@"
-    fi
-}
 
 # =========================================
 # Step 1: Install/Update Trivy
@@ -164,20 +196,22 @@ fi
 echo ""
 echo "[INFO] Checking PATH..."
 
-if echo "$PATH" | grep -q "$TRIVYSCAN_INSTALL_DIR"; then
-    echo "[OK] $TRIVYSCAN_INSTALL_DIR already in PATH"
-else
-    echo "[WARN] $TRIVYSCAN_INSTALL_DIR is not in PATH"
-    if [ -n "$ZSH_VERSION" ]; then
-        echo "export PATH=\"\$PATH:$TRIVYSCAN_INSTALL_DIR\"" >> "$HOME/.zshrc"
-        echo "[OK] Added to ~/.zshrc"
-    elif [ -n "$BASH_VERSION" ]; then
-        echo "export PATH=\"\$PATH:$TRIVYSCAN_INSTALL_DIR\"" >> "$HOME/.bashrc"
-        echo "[OK] Added to ~/.bashrc"
+for dir in "$TRIVY_INSTALL_DIR" "$TRIVYSCAN_INSTALL_DIR"; do
+    if echo "$PATH" | grep -q "$dir"; then
+        echo "[OK] $dir already in PATH"
     else
-        echo "[INFO] Add manually: export PATH=\"\$PATH:$TRIVYSCAN_INSTALL_DIR\""
+        echo "[WARN] $dir is not in PATH"
+        if [ -n "$ZSH_VERSION" ]; then
+            echo "export PATH=\"\$PATH:$dir\"" >> "$HOME/.zshrc"
+            echo "[OK] Added to ~/.zshrc"
+        elif [ -n "$BASH_VERSION" ]; then
+            echo "export PATH=\"\$PATH:$dir\"" >> "$HOME/.bashrc"
+            echo "[OK] Added to ~/.bashrc"
+        else
+            echo "[INFO] Add manually: export PATH=\"\$PATH:$dir\""
+        fi
     fi
-fi
+done
 
 # =========================================
 # Step 4: Verify

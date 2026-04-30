@@ -11,9 +11,9 @@ $policy = Get-ExecutionPolicy -Scope Process
 if (-not $isAdmin -or $policy -ne 'Bypass') {
     Write-Host "[INFO] Restarting script with Admin + Bypass..."
 
-    $args = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $passArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
 
-    Start-Process powershell -ArgumentList $args -Verb RunAs
+    Start-Process powershell -ArgumentList $passArgs -Verb RunAs
     exit
 }
 
@@ -29,8 +29,49 @@ $ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Args
 # =========================================
 $Force = $false
-if ($args -contains "--force" -or $args -contains "-f") {
-    $Force = $true
+$Uninstall = $false
+
+foreach ($arg in $args) {
+    switch -Regex ($arg) {
+        "^(--force|-f)$"   { $Force = $true }
+        "^(--uninstall|-u)$" { $Uninstall = $true }
+        "^(--help|-h)$"     { 
+            Write-Host "Usage: .\install.ps1 [OPTIONS]"
+            Write-Host "  --force, -f     Force reinstall"
+            Write-Host "  --uninstall, -u Uninstall both"
+            Write-Host "  --help, -h      Show this help"
+            exit 0
+        }
+    }
+}
+
+# =========================================
+# Uninstall
+# =========================================
+if ($Uninstall) {
+    Write-Host ""
+    Write-Host "[INFO] Uninstalling..."
+
+    # Remove from PATH
+    $currentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $newPath = ($currentPath -split ';' | Where-Object { $_ -notin @($TrivyDir, $TrivyScanDir) }) -join ';'
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "Machine")
+
+    # Remove Trivy
+    if (Test-Path $TrivyDir) {
+        Remove-Item $TrivyDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "[OK] Removed $TrivyDir"
+    }
+
+    # Remove TrivyScan
+    if (Test-Path $TrivyScanDir) {
+        Remove-Item $TrivyScanDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "[OK] Removed $TrivyScanDir"
+    }
+
+    Write-Host ""
+    Write-Host "[SUCCESS] Uninstall complete! Restart your terminal."
+    exit 0
 }
 
 # =========================================
@@ -119,7 +160,7 @@ $currentTrivy = $null
 
 # Check if Trivy is already installed
 if (Test-Path "$TrivyDir\trivy.exe") {
-    $currentTrivy = (& "$TrivyDir\trivy.exe" --version 2>$null) -replace ".*?([0-9]+\.[0-9]+\.[0-9]+).*", '$1'
+    $currentTrivy = ((& "$TrivyDir\trivy.exe" --version 2>$null) -replace ".*?([0-9]+\.[0-9]+\.[0-9]+).*", '$1' | Select-Object -First 1)
 }
 
 # Get latest version from GitHub
@@ -225,7 +266,7 @@ if (-not $latestTrivy)         { Write-Host "[--] Trivy     -> skipped (cannot f
 elseif ($trivyUpdated)         { Write-Host "[OK] Trivy     -> installed/updated to v$latestTrivy" }
 else                          { Write-Host "[OK] Trivy     -> already up to date (v$currentTrivy)" }
 
-if (-not $SourceExe)           { Write-Host "[--] TrivyScan -> skipped (binary not found)" }
+if (-not (Test-Path $SourceExe)) { Write-Host "[--] TrivyScan -> skipped (binary not found)" }
 elseif ($trivyscanUpdated)     { Write-Host "[OK] TrivyScan -> installed/updated" }
 elseif ($currentTrivyscan)    { Write-Host "[OK] TrivyScan -> already installed" }
 else                          { Write-Host "[--] TrivyScan -> install failed" }
