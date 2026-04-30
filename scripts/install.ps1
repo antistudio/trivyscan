@@ -26,6 +26,14 @@ $TrivyZip     = "$env:TEMP\trivy.zip"
 $ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # =========================================
+# Args
+# =========================================
+$Force = $false
+if ($args -contains "--force" -or $args -contains "-f") {
+    $Force = $true
+}
+
+# =========================================
 # Detect Arch
 # =========================================
 $Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
@@ -125,7 +133,7 @@ try {
 
 if (-not $latestTrivy) {
     Write-Host "[WARN] Skipping Trivy installation"
-} elseif ($currentTrivy -and $currentTrivy -eq $latestTrivy) {
+} elseif (-not $Force -and $currentTrivy -and $currentTrivy -eq $latestTrivy) {
     Write-Host "[OK] Trivy already up to date (v$currentTrivy)"
 } else {
     if ($currentTrivy) {
@@ -156,17 +164,21 @@ if (Test-Path $TargetExe) {
     $currentTrivyscan = (& $TargetExe --version 2>$null) | Select-Object -First 1
 }
 
-if (-not $SourceExe) {
+if (-not (Test-Path $SourceExe)) {
     Write-Host "[ERROR] Binary not found: trivyscan_windows.exe"
     Write-Host "        Available files:"
     Get-ChildItem "$ScriptDir\trivyscan_*" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "        $_" }
-} elseif ($currentTrivyscan) {
+} elseif (-not $Force -and $currentTrivyscan) {
     Write-Host "[OK] TrivyScan already installed"
 } else {
-    Write-Host "[INFO] TrivyScan not found, installing..."
+    if ($currentTrivyscan) {
+        Write-Host "[INFO] Reinstalling TrivyScan..."
+    } else {
+        Write-Host "[INFO] TrivyScan not found, installing..."
+    }
 
     if (Install-TrivyScan -SourceExe $SourceExe -TargetExe $TargetExe) {
-        Write-Host "[OK] TrivyScan installed"
+        Write-Host "[OK] TrivyScan installed/updated"
         $trivyscanUpdated = $true
     }
 }

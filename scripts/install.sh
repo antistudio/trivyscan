@@ -8,6 +8,16 @@ TRIVYSCAN_INSTALL_DIR="/usr/local/bin"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # =========================================
+# Args
+# =========================================
+FORCE=false
+for arg in "$@"; do
+    case "$arg" in
+        --force|-f) FORCE=true ;;
+    esac
+done
+
+# =========================================
 # Detect OS + Arch
 # =========================================
 OS=$(uname -s)
@@ -71,7 +81,7 @@ fi
 
 if [ -z "$latest_trivy" ]; then
     echo "[WARN] Cannot fetch Trivy version - skipping"
-elif [ -n "$current_trivy" ] && [ "$current_trivy" = "$latest_trivy" ]; then
+elif ! $FORCE && [ -n "$current_trivy" ] && [ "$current_trivy" = "$latest_trivy" ]; then
     echo "[OK] Trivy already up to date (v$current_trivy)"
 else
     if [ -n "$current_trivy" ]; then
@@ -128,10 +138,14 @@ if [ ! -f "$source_bin" ]; then
     echo "[ERROR] Binary not found: trivyscan_${OS_GO}"
     echo "        Available files in current directory:"
     ls "$SCRIPT_DIR"/trivyscan_* 2>/dev/null || echo "        (none found)"
-elif [ -n "$current_trivyscan" ]; then
+elif ! $FORCE && [ -n "$current_trivyscan" ]; then
     echo "[OK] TrivyScan already installed"
 else
-    echo "[INFO] TrivyScan not found, installing..."
+    if [ -n "$current_trivyscan" ]; then
+        echo "[INFO] Reinstalling TrivyScan..."
+    else
+        echo "[INFO] TrivyScan not found, installing..."
+    fi
 
     run_privileged cp "$source_bin" "$TRIVYSCAN_INSTALL_DIR/trivyscan"
     run_privileged chmod 755 "$TRIVYSCAN_INSTALL_DIR/trivyscan"
