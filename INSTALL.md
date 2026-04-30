@@ -86,30 +86,6 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ---
 
-## Update
-
-Download the latest archive, extract, then run the update script. It will fetch the latest Trivy from GitHub and replace the TrivyScan binary from the local file.
-
-### Linux / macOS
-
-```bash
-chmod +x update.sh
-./update.sh
-```
-
-### Windows
-
-Open PowerShell as Administrator and run:
-
-```powershell
-cd path\to\extracted\folder
-powershell -ExecutionPolicy Bypass -File .\update.ps1
-```
-
-**Alternative:** Double-click `update.ps1`
-
----
-
 ## Verify
 
 ```bash
