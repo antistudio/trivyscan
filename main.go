@@ -649,6 +649,12 @@ func main() {
 		}
 	}
 
+	if !opts.SkipDBUpdate {
+		if err := updateTrivyDB(ctx); err != nil {
+			log.Warn().Err(err).Msg("DB update failed, continuing")
+		}
+	}
+
 	files, err := collectFiles(opts.Input)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error collecting files")
@@ -659,12 +665,6 @@ func main() {
 
 	log.Info().Str("version", version).Msg("TRIVY SCANNER")
 	log.Info().Msg("Starting scan")
-
-	if !opts.SkipDBUpdate {
-		if err := updateTrivyDB(ctx); err != nil {
-			log.Warn().Err(err).Msg("DB update failed, continuing")
-		}
-	}
 
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
 		log.Fatal().Err(err).Msg("Output dir error")
