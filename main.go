@@ -385,8 +385,8 @@ func isRetryableError(err error) bool {
 	return false
 }
 
-// runWithRetry executes operation with retry
-func runWithRetry(ctx context.Context, operation string, fn func() error) error {
+// retryOperation executes operation with retry
+func retryOperation(ctx context.Context, operation string, fn func() error) error {
 	for attempt := 0; attempt <= defaultMaxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
@@ -467,7 +467,7 @@ func processScanWithOutput(ctx context.Context, inputFile, outputDir, severity, 
 // checkTrivyInstalled verifies Trivy is installed
 func checkTrivyInstalled(ctx context.Context) error {
 	log.Info().Msg("Checking Trivy...")
-	return runWithRetry(ctx, "trivy version", func() error {
+	return retryOperation(ctx, "trivy version", func() error {
 		output, err := exec.CommandContext(ctx, trivyCmd, "--version").CombinedOutput()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -543,7 +543,7 @@ func updateTrivyDB(ctx context.Context) error {
 		default:
 		}
 
-		err := runWithRetry(ctx, "db update", func() error {
+		err := retryOperation(ctx, "db update", func() error {
 			cmd := exec.CommandContext(ctx, trivyCmd, trivySubCmd, db.flag)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
