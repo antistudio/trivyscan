@@ -19,19 +19,19 @@
       --ac: #2f5fc4;
       --ac2: #1e3e8a;
 
-      /* Severity Colors (Sentra style) */
+      /* Severity Colors (Nessus style) */
       --critical: #9b2335;
-      --critical-bg: #e2d0ce;
-      --critical-bd: #c09490;
+      --critical-bg: #f5dde0;
+      --critical-bd: #d4949c;
       --high: #d95215;
-      --high-bg: #e2d8c0;
-      --high-bd: #c4ae6a;
+      --high-bg: #fce4d6;
+      --high-bd: #e8a882;
       --medium: #e8a63a;
-      --medium-bg: #e2d8c0;
-      --medium-bd: #c4ae6a;
+      --medium-bg: #fdf3e0;
+      --medium-bd: #e8cc8a;
       --low: #65a637;
-      --low-bg: #c4ddd0;
-      --low-bd: #78b898;
+      --low-bg: #e2f0da;
+      --low-bd: #a8d498;
 
       --tag: #c4c8d0;
       --hash: #1e3e8a;
@@ -169,23 +169,23 @@
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 5px 12px;
+      padding: 6px 14px;
       border-radius: 20px;
-      border: 2px solid transparent;
+      border: 1.5px solid transparent;
       font-family: var(--mono);
       font-size: 12px;
       font-weight: 700;
       letter-spacing: 0.8px;
       text-transform: uppercase;
       cursor: pointer;
-      transition: opacity 0.15s, transform 0.1s, box-shadow 0.15s;
+      transition: all 0.2s ease;
       user-select: none;
       opacity: 0.38;
     }
 
     .filter-pill.active {
       opacity: 1;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
     }
 
     .filter-pill:hover {
@@ -202,9 +202,9 @@
       color: var(--critical);
     }
     .filter-pill.pill-CRITICAL.active {
-      background: var(--critical);
+      background: var(--critical-bg);
       border-color: var(--critical);
-      color: white;
+      color: var(--critical);
     }
 
     .filter-pill.pill-HIGH {
@@ -213,9 +213,9 @@
       color: var(--high);
     }
     .filter-pill.pill-HIGH.active {
-      background: var(--high);
+      background: var(--high-bg);
       border-color: var(--high);
-      color: white;
+      color: var(--high);
     }
 
     .filter-pill.pill-MEDIUM {
@@ -224,9 +224,9 @@
       color: var(--medium);
     }
     .filter-pill.pill-MEDIUM.active {
-      background: var(--medium);
+      background: var(--medium-bg);
       border-color: var(--medium);
-      color: white;
+      color: var(--medium);
     }
 
     .filter-pill.pill-LOW {
@@ -235,9 +235,9 @@
       color: var(--low);
     }
     .filter-pill.pill-LOW.active {
-      background: var(--low);
+      background: var(--low-bg);
       border-color: var(--low);
-      color: white;
+      color: var(--low);
     }
 
     .filter-pill.pill-UNKNOWN {
@@ -252,13 +252,14 @@
     }
 
     .pill-count {
-      background: rgba(255,255,255,0.35);
-      border-radius: 10px;
-      padding: 1px 6px;
-      font-size: 11px;
-    }
-    .filter-pill:not(.active) .pill-count {
       background: rgba(0,0,0,0.08);
+      border-radius: 10px;
+      padding: 1px 7px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .filter-pill.active .pill-count {
+      background: rgba(0,0,0,0.1);
     }
 
     /* ══ COLLAPSE BUTTONS ══════════════════════════════ */
@@ -468,8 +469,8 @@
     /* ══ SEVERITY BADGE ═══════════════════════════════ */
     .severity-badge {
       display: inline-block;
-      padding: 4px 9px;
-      border-radius: var(--r2);
+      padding: 5px 12px;
+      border-radius: 6px;
       font-family: var(--mono);
       font-size: 11px;
       font-weight: 700;
@@ -479,23 +480,27 @@
     }
 
     .severity-badge.CRITICAL {
-      background: var(--critical);
-      color: white;
+      background: var(--critical-bg);
+      border-color: var(--critical-bd);
+      color: var(--critical);
     }
 
     .severity-badge.HIGH {
-      background: var(--high);
-      color: white;
+      background: var(--high-bg);
+      border-color: var(--high-bd);
+      color: var(--high);
     }
 
     .severity-badge.MEDIUM {
-      background: var(--medium);
-      color: white;
+      background: var(--medium-bg);
+      border-color: var(--medium-bd);
+      color: var(--medium);
     }
 
     .severity-badge.LOW {
-      background: var(--low);
-      color: white;
+      background: var(--low-bg);
+      border-color: var(--low-bd);
+      color: var(--low);
     }
 
     .severity-badge.UNKNOWN {
@@ -992,7 +997,7 @@
 <body>
 <div class="container">
   <div class="header">
-    <div class="logo">TRIVY<span> //</span></div>
+    <div class="logo">TRIVY SCAN<span> //</span></div>
     <div class="header-right">Scan Complete</div>
   </div>
   <div class="section">
