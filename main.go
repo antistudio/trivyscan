@@ -252,11 +252,15 @@ func updateTrivyDB(ctx context.Context) error {
 // File collection
 // ---------------------------------------------------------------------------
 
+const maxWalkDepth = 5
+
 func collectFiles(input string) ([]string, error) {
 	info, err := os.Stat(input)
 	if err != nil {
 		return nil, fmt.Errorf("cannot access %q: %w", input, err)
 	}
+
+	// Single file input
 	if !info.IsDir() {
 		if !strings.HasSuffix(strings.ToLower(input), ".tar") {
 			return nil, fmt.Errorf("not a .tar file: %s", input)
@@ -264,12 +268,26 @@ func collectFiles(input string) ([]string, error) {
 		return []string{input}, nil
 	}
 
+	// Directory input — walk up to maxWalkDepth levels
+	baseDepth := strings.Count(filepath.Clean(input), string(os.PathSeparator))
+
 	var files []string
 	err = filepath.WalkDir(input, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return err
+			log.Warn().Str("path", path).Err(err).Msg("Skipping inaccessible path")
+			return nil
 		}
-		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".tar") {
+
+		depth := strings.Count(filepath.Clean(path), string(os.PathSeparator)) - baseDepth
+		if d.IsDir() {
+			if depth >= maxWalkDepth {
+				log.Debug().Str("dir", path).Msg("Max depth reached, skipping")
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if strings.HasSuffix(strings.ToLower(d.Name()), ".tar") {
 			files = append(files, path)
 		}
 		return nil
@@ -277,7 +295,8 @@ func collectFiles(input string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot walk directory: %w", err)
 	}
-	log.Info().Int("count", len(files)).Str("directory", input).Msg("Found .tar files")
+
+	log.Info().Int("count", len(files)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar files")
 	return files, nil
 }
 
