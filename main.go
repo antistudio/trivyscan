@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"os/exec"
@@ -15,8 +16,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/charlievieth/fastwalk"
 
 	"github.com/projectdiscovery/goflags"
 	"github.com/rs/zerolog"
@@ -268,11 +272,16 @@ func collectFiles(input string) ([]string, error) {
 		return []string{input}, nil
 	}
 
-	// Directory input — walk up to maxWalkDepth levels
+	// Directory input — walk up to maxWalkDepth levels using fastwalk
 	baseDepth := strings.Count(filepath.Clean(input), string(os.PathSeparator))
 
-	var files []string
-	err = filepath.WalkDir(input, func(path string, d os.DirEntry, err error) error {
+	var (
+		files []string
+		mu    sync.Mutex
+	)
+
+	conf := fastwalk.Config{Follow: false}
+	err = fastwalk.Walk(&conf, input, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			log.Warn().Str("path", path).Err(err).Msg("Skipping inaccessible path")
 			return nil
@@ -288,7 +297,9 @@ func collectFiles(input string) ([]string, error) {
 		}
 
 		if strings.HasSuffix(strings.ToLower(d.Name()), ".tar") {
+			mu.Lock()
 			files = append(files, path)
+			mu.Unlock()
 		}
 		return nil
 	})

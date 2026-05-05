@@ -3,6 +3,7 @@ module github.com/anhnmt/trivyscan
 go 1.26
 
 require (
+	github.com/charlievieth/fastwalk v1.0.14
 	github.com/projectdiscovery/goflags v0.1.74
 	github.com/rs/zerolog v1.35.1
 )
