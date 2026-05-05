@@ -28,12 +28,9 @@ import (
 // Version is set via ldflags at build time
 var version = "dev"
 
-// TemplateContent holds the HTML template for Trivy reports
-//
 //go:embed trivy-template.html
 var templateContent string
 
-// Command constants
 const (
 	trivyCmd            = "trivy"
 	trivySubCmd         = "image"
@@ -45,7 +42,6 @@ const (
 	hashLength          = 6
 )
 
-// Default configuration values
 const (
 	defaultMaxRetries        = 3
 	defaultConcurrency       = 3
@@ -58,7 +54,6 @@ const (
 	defaultScanTimeout       = 10 * time.Minute
 )
 
-// CLI options
 type options struct {
 	Input          string
 	Output         string
@@ -71,18 +66,22 @@ type options struct {
 	MaxRetries     int
 }
 
-// scanResult holds the outcome of a single scan
 type scanResult struct {
 	File       string
 	OutputFile string
 	Error      error
 	Duration   time.Duration
+	Skipped    bool // true when file is invalid (not a Docker/OCI image)
 }
 
-// Semaphore is a channel-based counting semaphore
+// ---------------------------------------------------------------------------
+// Semaphore
+// ---------------------------------------------------------------------------
+
 type Semaphore chan struct{}
 
 func NewSemaphore(max int) Semaphore { return make(Semaphore, max) }
+
 func (s Semaphore) Acquire(ctx context.Context) error {
 	select {
 	case s <- struct{}{}:
@@ -91,16 +90,20 @@ func (s Semaphore) Acquire(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
 func (s Semaphore) Release() { <-s }
 
-// CircuitBreaker states
+// ---------------------------------------------------------------------------
+// CircuitBreaker — only trips on transient infrastructure errors,
+// NOT on invalid-file errors.
+// ---------------------------------------------------------------------------
+
 const (
 	stateClosed   int32 = 0
 	stateOpen     int32 = 1
 	stateHalfOpen int32 = 2
 )
 
-// CircuitBreaker prevents cascading failures
 type CircuitBreaker struct {
 	mu            sync.RWMutex
 	failures      int32
@@ -163,7 +166,69 @@ func (cb *CircuitBreaker) RecordFailure() {
 	}
 }
 
-// scanQueue fans out files concurrently using a semaphore, collects results via channel
+// ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+// isInvalidImageError returns true when the tar file is not a valid Docker/OCI
+// image — no point retrying, and must NOT trip the circuit breaker.
+func isInvalidImageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, p := range []string{
+		"manifest.json not found",
+		"index.json: not a directory",
+		"unable to initialize archive image",
+		"unable to open",
+	} {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTransientError returns true for infrastructure / lock errors that should
+// trip the circuit breaker and be retried.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, p := range []string{
+		"timeout", "i/o timeout", "context deadline exceeded",
+		"connection refused", "connection reset", "no such host",
+		"temporary failure", "network", "connection",
+		"database is locked", "database locked",
+		"sqlite_busy", "sqlite_locked",
+		"cache may be in use",
+	} {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRetryableError returns true only for errors worth retrying.
+// Invalid image errors are explicitly excluded.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isInvalidImageError(err) {
+		return false
+	}
+	return isTransientError(err)
+}
+
+// ---------------------------------------------------------------------------
+// Scan queue
+// ---------------------------------------------------------------------------
+
+// scanQueue fans out all files concurrently (bounded by sem), collects results.
 func scanQueue(
 	ctx context.Context,
 	files []string,
@@ -183,18 +248,31 @@ func scanQueue(
 			start := time.Now()
 
 			if !cb.Allow() {
-				out <- scanResult{File: file, Error: fmt.Errorf("circuit breaker open"), Duration: time.Since(start)}
+				out <- scanResult{
+					File:     file,
+					Error:    fmt.Errorf("circuit breaker open"),
+					Duration: time.Since(start),
+				}
 				return
 			}
 
 			outFile, err := runWithRetry(ctx, file, sem, maxRetries, processFn)
-			if err != nil {
-				cb.RecordFailure()
-			} else {
-				cb.RecordSuccess()
-			}
 
-			out <- scanResult{File: file, OutputFile: outFile, Error: err, Duration: time.Since(start)}
+			switch {
+			case err == nil:
+				cb.RecordSuccess()
+				out <- scanResult{File: file, OutputFile: outFile, Duration: time.Since(start)}
+
+			case isInvalidImageError(err):
+				// Invalid tar — log as warning, mark skipped, do NOT trip CB
+				log.Warn().Str("file", filepath.Base(file)).Msg("Skipped: not a valid Docker/OCI image tar")
+				out <- scanResult{File: file, Error: err, Duration: time.Since(start), Skipped: true}
+
+			default:
+				// Transient / unknown error — trip CB
+				cb.RecordFailure()
+				out <- scanResult{File: file, Error: err, Duration: time.Since(start)}
+			}
 		}(f)
 	}
 
@@ -206,7 +284,7 @@ func scanQueue(
 	return out
 }
 
-// runWithRetry wraps processFn with semaphore + exponential back-off retry
+// runWithRetry wraps processFn with semaphore + exponential back-off retry.
 func runWithRetry(
 	ctx context.Context,
 	file string,
@@ -234,6 +312,7 @@ func runWithRetry(
 		}
 		lastErr = err
 
+		// Never retry invalid-image errors
 		if !isRetryableError(err) || attempt >= maxRetries {
 			return "", err
 		}
@@ -256,93 +335,75 @@ func runWithRetry(
 	return "", fmt.Errorf("failed after %d attempts: %w", maxRetries+1, lastErr)
 }
 
-// zerologPrettySetup configures zerolog console output
-func zerologPrettySetup() {
-	zerolog.TimeFieldFormat = time.RFC3339
-	output := zerolog.ConsoleWriter{
-		Out:        os.Stderr,
-		TimeFormat: time.RFC3339,
-		FormatMessage: func(i interface{}) string {
-			return fmt.Sprintf(" %s", i)
-		},
-		FormatCaller: func(i interface{}) string {
-			var s string
-			if c, ok := i.(string); ok {
-				s = c
-			}
-			if len(s) > 0 {
-				if idx := strings.LastIndex(s, "/"); idx >= 0 {
-					s = s[idx+1:]
-				}
-				if idx := strings.LastIndex(s, "\\"); idx >= 0 {
-					s = s[idx+1:]
-				}
-			}
-			return s
-		},
+// ---------------------------------------------------------------------------
+// Trivy helpers
+// ---------------------------------------------------------------------------
+
+// trivyDefaultCacheDir returns the Trivy cache directory, respecting env vars.
+func trivyDefaultCacheDir() string {
+	if d := os.Getenv("TRIVY_CACHE_DIR"); d != "" {
+		return d
 	}
-	log.Logger = zerolog.New(output).With().Timestamp().Caller().Logger()
+	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "trivy")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cache", "trivy")
 }
 
-// calculateBackoff computes exponential backoff with jitter
-func calculateBackoff(attempt int) time.Duration {
-	backoff := float64(defaultInitialBackoff) * math.Pow(defaultBackoffMultiplier, float64(attempt))
-	if backoff > float64(defaultMaxBackoff) {
-		backoff = float64(defaultMaxBackoff)
-	}
-	jitter := backoff * defaultJitterFactor * (2*math.Max(0, math.Min(1, float64(time.Now().UnixNano()%1000)/1000.0)) - 1)
-	return time.Duration(backoff + jitter)
-}
-
-// isRetryableError checks if error warrants retry
-func isRetryableError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := strings.ToLower(err.Error())
-	for _, p := range []string{
-		"context deadline exceeded", "context canceled",
-		"connection refused", "connection reset",
-		"temporary failure", "timeout", "i/o timeout",
-		"no such host", "network", "connection",
-		"database is locked", "database locked",
-		"sqlite_busy", "sqlite_locked",
-	} {
-		if strings.Contains(errStr, p) {
-			return true
+// copyTrivyDB hard-links (or copies) the shared "db" and "java-db" subdirs
+// into destCacheDir so each scan process gets its own lock-free DB copy.
+// The "fanal" layer cache is intentionally NOT copied — it is per-image and
+// would cause lock contention if shared.
+func copyTrivyDB(destCacheDir string) error {
+	src := trivyDefaultCacheDir()
+	for _, sub := range []string{"db", "java-db"} {
+		srcSub := filepath.Join(src, sub)
+		if _, err := os.Stat(srcSub); os.IsNotExist(err) {
+			continue // not downloaded yet; scan will fail with a clear error
 		}
-	}
-	return false
-}
-
-// retryOperation executes operation with retry
-func retryOperation(ctx context.Context, operation string, fn func() error) error {
-	for attempt := 0; attempt <= defaultMaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
-		default:
-		}
-
-		if err := fn(); err == nil {
-			return nil
-		} else if attempt >= defaultMaxRetries || !isRetryableError(err) {
+		dstSub := filepath.Join(destCacheDir, sub)
+		if err := os.MkdirAll(dstSub, 0755); err != nil {
 			return err
 		}
-
-		backoff := calculateBackoff(attempt)
-		log.Warn().Int("attempt", attempt+1).Dur("backoff", backoff).Str("operation", operation).Msg("Retry failed, will retry")
-
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
-		case <-time.After(backoff):
+		entries, err := os.ReadDir(srcSub)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			s := filepath.Join(srcSub, e.Name())
+			d := filepath.Join(dstSub, e.Name())
+			// Hard-link is zero-cost and safe — DB files are read-only during scan
+			if err := os.Link(s, d); err != nil {
+				if err2 := copyFile(s, d); err2 != nil {
+					return err2
+				}
+			}
 		}
 	}
-	return fmt.Errorf("%s failed", operation)
+	return nil
 }
 
-// processScanWithOutput scans a tar file and writes the HTML report to outputDir
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// processScanWithOutput scans one tar and writes an HTML report.
+// It creates an isolated Trivy cache dir to avoid lock contention.
 func processScanWithOutput(ctx context.Context, inputFile, outputDir, severity, scanner string) (string, error) {
 	scanCtx, cancel := context.WithTimeout(ctx, defaultScanTimeout)
 	defer cancel()
@@ -351,10 +412,29 @@ func processScanWithOutput(ctx context.Context, inputFile, outputDir, severity, 
 		return "", fmt.Errorf("file not found: %s", inputFile)
 	}
 
-	out := outputFilenameCustom(inputFile, outputDir)
-	log.Info().Str("file", filepath.Base(inputFile)).Str("scanner", scanner).Msg("Scanning")
+	// Isolated cache dir — prevents "cache may be in use by another process"
+	cacheDir, err := os.MkdirTemp("", "trivy-cache-*")
+	if err != nil {
+		return "", fmt.Errorf("create cache dir: %w", err)
+	}
+	defer os.RemoveAll(cacheDir)
 
-	args := []string{trivyCmd, trivySubCmd, "--input", inputFile, "--format", "template", "--template", templateContent, "--output", out, trivySkipDB, trivySkipJavaDB}
+	if err := copyTrivyDB(cacheDir); err != nil {
+		return "", fmt.Errorf("copy trivy db: %w", err)
+	}
+
+	outFile := outputFilenameCustom(inputFile, outputDir)
+	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
+
+	args := []string{
+		trivyCmd, trivySubCmd,
+		"--cache-dir", cacheDir,
+		"--input", inputFile,
+		"--format", "template",
+		"--template", templateContent,
+		"--output", outFile,
+		trivySkipDB, trivySkipJavaDB,
+	}
 	if severity != "" {
 		args = append(args, "--severity", severity)
 	}
@@ -362,18 +442,17 @@ func processScanWithOutput(ctx context.Context, inputFile, outputDir, severity, 
 		args = append(args, "--scanner", scanner)
 	}
 
-	cmd := exec.CommandContext(scanCtx, args[0], args[1:]...)
-	output, err := cmd.CombinedOutput()
+	output, err := exec.CommandContext(scanCtx, args[0], args[1:]...).CombinedOutput()
 	if err != nil {
 		if scanCtx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("scan timeout: %w", err)
 		}
 		return "", fmt.Errorf("trivy failed: %w\n%s", err, output)
 	}
-	return out, nil
+	return outFile, nil
 }
 
-// checkTrivyInstalled verifies Trivy is installed
+// checkTrivyInstalled verifies Trivy is installed and reachable.
 func checkTrivyInstalled(ctx context.Context) error {
 	log.Info().Msg("Checking Trivy...")
 	return retryOperation(ctx, "trivy version", func() error {
@@ -384,12 +463,11 @@ func checkTrivyInstalled(ctx context.Context) error {
 			}
 			return buildTrivyNotFoundError()
 		}
-		log.Info().Msgf("Trivy: %s\n", strings.TrimSpace(string(output)))
+		log.Info().Msgf("Trivy: %s", strings.TrimSpace(string(output)))
 		return nil
 	})
 }
 
-// buildTrivyNotFoundError creates installation instructions
 func buildTrivyNotFoundError() error {
 	var sb strings.Builder
 	sb.WriteString("Trivy not found in PATH.\n\n")
@@ -403,54 +481,20 @@ func buildTrivyNotFoundError() error {
 	return errors.New(sb.String())
 }
 
-// collectFiles gathers .tar files from input path
-func collectFiles(input string) ([]string, error) {
-	info, err := os.Stat(input)
-	if err != nil {
-		return nil, fmt.Errorf("cannot access '%s': %w", input, err)
-	}
-
-	if !info.IsDir() {
-		if !strings.HasSuffix(strings.ToLower(input), ".tar") {
-			return nil, fmt.Errorf("not a .tar file: %s", input)
-		}
-		return []string{input}, nil
-	}
-
-	entries, err := os.ReadDir(input)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read directory: %w", err)
-	}
-
-	var files []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".tar") {
-			files = append(files, filepath.Join(input, entry.Name()))
-		}
-	}
-
-	log.Info().Int("count", len(files)).Str("directory", input).Msg("Found .tar files")
-	return files, nil
-}
-
-// updateTrivyDB updates Trivy databases
+// updateTrivyDB downloads the vulnerability and Java databases.
 func updateTrivyDB(ctx context.Context) error {
-	databases := []struct{ name, flag string }{
+	log.Info().Msg("Updating databases...")
+	for _, db := range []struct{ name, flag string }{
 		{"Vulnerability", trivyDownloadDB},
 		{"Java", trivyDownloadJavaDB},
-	}
-
-	log.Info().Msg("Updating databases...")
-	for _, db := range databases {
+	} {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-
 		err := retryOperation(ctx, "db update", func() error {
-			cmd := exec.CommandContext(ctx, trivyCmd, trivySubCmd, db.flag)
-			output, err := cmd.CombinedOutput()
+			output, err := exec.CommandContext(ctx, trivyCmd, trivySubCmd, db.flag).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("%s db failed: %w\n%s", db.name, err, output)
 			}
@@ -465,14 +509,81 @@ func updateTrivyDB(ctx context.Context) error {
 	return nil
 }
 
-// fileHash computes SHA-256 hash of file
+// collectFiles gathers .tar files from a file path or directory.
+func collectFiles(input string) ([]string, error) {
+	info, err := os.Stat(input)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access %q: %w", input, err)
+	}
+	if !info.IsDir() {
+		if !strings.HasSuffix(strings.ToLower(input), ".tar") {
+			return nil, fmt.Errorf("not a .tar file: %s", input)
+		}
+		return []string{input}, nil
+	}
+
+	var files []string
+	err = filepath.WalkDir(input, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".tar") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cannot walk directory: %w", err)
+	}
+
+	log.Info().Int("count", len(files)).Str("directory", input).Msg("Found .tar files")
+	return files, nil
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+func retryOperation(ctx context.Context, operation string, fn func() error) error {
+	for attempt := 0; attempt <= defaultMaxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
+		default:
+		}
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if attempt >= defaultMaxRetries || !isRetryableError(err) {
+			return err
+		}
+		backoff := calculateBackoff(attempt)
+		log.Warn().Int("attempt", attempt+1).Dur("backoff", backoff).Str("operation", operation).Err(err).Msg("Retry")
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s cancelled: %w", operation, ctx.Err())
+		case <-time.After(backoff):
+		}
+	}
+	return fmt.Errorf("%s failed", operation)
+}
+
+func calculateBackoff(attempt int) time.Duration {
+	b := float64(defaultInitialBackoff) * math.Pow(defaultBackoffMultiplier, float64(attempt))
+	if b > float64(defaultMaxBackoff) {
+		b = float64(defaultMaxBackoff)
+	}
+	jitter := b * defaultJitterFactor * (2*math.Max(0, math.Min(1, float64(time.Now().UnixNano()%1000)/1000.0)) - 1)
+	return time.Duration(b + jitter)
+}
+
 func fileHash(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -484,7 +595,6 @@ func fileHash(filePath string) (string, error) {
 	return hash[:hashLength], nil
 }
 
-// outputFilenameCustom generates output filename with custom directory
 func outputFilenameCustom(inputFile, outputDir string) string {
 	hash, err := fileHash(inputFile)
 	if err != nil {
@@ -493,6 +603,26 @@ func outputFilenameCustom(inputFile, outputDir string) string {
 	base := strings.TrimSuffix(filepath.Base(inputFile), filepath.Ext(inputFile))
 	return filepath.Join(outputDir, fmt.Sprintf("%s_%s-report.html", base, hash))
 }
+
+func zerologPrettySetup() {
+	zerolog.TimeFieldFormat = time.RFC3339
+	log.Logger = zerolog.New(zerolog.ConsoleWriter{
+		Out:           os.Stderr,
+		TimeFormat:    time.RFC3339,
+		FormatMessage: func(i interface{}) string { return fmt.Sprintf(" %s", i) },
+		FormatCaller: func(i interface{}) string {
+			s, _ := i.(string)
+			if idx := strings.LastIndexAny(s, `/\`); idx >= 0 {
+				s = s[idx+1:]
+			}
+			return s
+		},
+	}).With().Timestamp().Caller().Logger()
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 func main() {
 	opts := options{}
@@ -510,7 +640,7 @@ func main() {
 		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels"),
 		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanner to use (vuln,misconfig,secret,license)"),
 		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip database update"),
-		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy check"),
+		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy installation check"),
 		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "r", defaultMaxRetries, "max retry attempts"),
 	)
 	flagSet.CreateGroup("info", "Info",
@@ -551,7 +681,7 @@ func main() {
 
 	if !opts.SkipDBUpdate {
 		if err := updateTrivyDB(ctx); err != nil {
-			log.Warn().Err(err).Msg("DB update failed, continuing")
+			log.Warn().Err(err).Msg("DB update failed, continuing with existing DB")
 		}
 	}
 
@@ -560,18 +690,18 @@ func main() {
 		log.Fatal().Err(err).Msg("Error collecting files")
 	}
 	if len(files) == 0 {
-		log.Fatal().Msgf("No .tar files in: %s", opts.Input)
+		log.Fatal().Msgf("No .tar files found in: %s", opts.Input)
 	}
 
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
-		log.Fatal().Err(err).Msg("Output dir error")
+		log.Fatal().Err(err).Msg("Cannot create output directory")
 	}
 
 	log.Info().Str("version", version).Int("files", len(files)).Int("concurrency", opts.Concurrency).Msg("Starting scan")
 
 	cb := NewCircuitBreaker(defaultCBThreshold, defaultCBTimeout)
 	cb.onStateChange = func(from, to string) {
-		log.Warn().Str("from", from).Str("to", to).Msg("Circuit breaker")
+		log.Warn().Str("from", from).Str("to", to).Msg("Circuit breaker state changed")
 	}
 
 	sem := NewSemaphore(opts.Concurrency)
@@ -580,15 +710,22 @@ func main() {
 	})
 
 	startTime := time.Now()
-	var successResults, failResults []scanResult
-	completed := 0
+	var (
+		successResults []scanResult
+		skippedResults []scanResult
+		failResults    []scanResult
+		completed      int
+	)
 
 	for result := range results {
 		completed++
-		if result.Error != nil {
-			failResults = append(failResults, result)
-		} else {
+		switch {
+		case result.Error == nil:
 			successResults = append(successResults, result)
+		case result.Skipped:
+			skippedResults = append(skippedResults, result)
+		default:
+			failResults = append(failResults, result)
 		}
 		if completed%5 == 0 || completed == len(files) {
 			log.Info().Int("done", completed).Int("total", len(files)).Msg("Progress")
@@ -596,16 +733,24 @@ func main() {
 	}
 
 	elapsed := time.Since(startTime)
-	log.Info().Msg("SCAN SUMMARY")
 
+	log.Info().Msg("── SCAN SUMMARY ──────────────────────────────")
 	for _, r := range successResults {
-		log.Info().Str("input", r.File).Str("output", r.OutputFile).Dur("duration", r.Duration).Msg("Success")
+		log.Info().Str("input", r.File).Str("output", r.OutputFile).Dur("duration", r.Duration).Msg("OK")
+	}
+	for _, r := range skippedResults {
+		log.Warn().Str("input", r.File).Msg("SKIPPED (invalid Docker/OCI tar)")
 	}
 	for _, r := range failResults {
-		log.Error().Str("input", r.File).Err(r.Error).Msg("Failed")
+		log.Error().Str("input", r.File).Err(r.Error).Msg("FAILED")
 	}
-
-	log.Info().Dur("duration", elapsed).Int("success", len(successResults)).Int("failed", len(failResults)).Int("total", len(files)).Msg("Complete")
+	log.Info().
+		Dur("duration", elapsed).
+		Int("success", len(successResults)).
+		Int("skipped", len(skippedResults)).
+		Int("failed", len(failResults)).
+		Int("total", len(files)).
+		Msg("Complete")
 
 	if len(failResults) > 0 {
 		os.Exit(1)
