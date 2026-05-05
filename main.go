@@ -71,24 +71,18 @@ type options struct {
 	MaxRetries     int
 }
 
-// Scan result
+// scanResult holds the outcome of a single scan
 type scanResult struct {
 	File       string
 	OutputFile string
 	Error      error
 	Duration   time.Duration
-	RetryCount int
 }
 
-// Semaphore is a channel-based counting semaphore — no mutex/cond, no deadlock risk
+// Semaphore is a channel-based counting semaphore
 type Semaphore chan struct{}
 
-// NewSemaphore creates a new semaphore with given capacity
-func NewSemaphore(max int) Semaphore {
-	return make(Semaphore, max)
-}
-
-// Acquire takes a slot; returns error if context is cancelled
+func NewSemaphore(max int) Semaphore { return make(Semaphore, max) }
 func (s Semaphore) Acquire(ctx context.Context) error {
 	select {
 	case s <- struct{}{}:
@@ -97,11 +91,7 @@ func (s Semaphore) Acquire(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-
-// Release returns a slot
-func (s Semaphore) Release() {
-	<-s
-}
+func (s Semaphore) Release() { <-s }
 
 // CircuitBreaker states
 const (
@@ -118,20 +108,15 @@ type CircuitBreaker struct {
 	state         atomic.Int32
 	threshold     int32
 	timeout       time.Duration
-	onStateChange func(string, string)
+	onStateChange func(from, to string)
 }
 
-// NewCircuitBreaker creates a new circuit breaker
 func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
-	cb := &CircuitBreaker{
-		threshold: int32(threshold),
-		timeout:   timeout,
-	}
+	cb := &CircuitBreaker{threshold: int32(threshold), timeout: timeout}
 	cb.state.Store(stateClosed)
 	return cb
 }
 
-// Allow checks if operation is allowed
 func (cb *CircuitBreaker) Allow() bool {
 	switch cb.state.Load() {
 	case stateClosed:
@@ -155,7 +140,6 @@ func (cb *CircuitBreaker) Allow() bool {
 	}
 }
 
-// RecordSuccess resets the circuit breaker
 func (cb *CircuitBreaker) RecordSuccess() {
 	if cb.state.Load() == stateHalfOpen {
 		cb.state.Store(stateClosed)
@@ -166,13 +150,11 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	}
 }
 
-// RecordFailure records a failure and may trip the circuit
 func (cb *CircuitBreaker) RecordFailure() {
 	atomic.AddInt32(&cb.failures, 1)
 	cb.mu.Lock()
 	cb.lastFailure = time.Now()
 	cb.mu.Unlock()
-
 	if atomic.LoadInt32(&cb.failures) >= cb.threshold && cb.state.Load() != stateOpen {
 		cb.state.Store(stateOpen)
 		if cb.onStateChange != nil {
@@ -181,148 +163,97 @@ func (cb *CircuitBreaker) RecordFailure() {
 	}
 }
 
-// WorkerPool manages a pool of workers for concurrent processing
-type WorkerPool struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	jobs       chan string
-	results    chan scanResult
-	wg         sync.WaitGroup
-	cb         *CircuitBreaker
-	semaphore  Semaphore
-	maxRetries int
-}
+// scanQueue fans out files concurrently using a semaphore, collects results via channel
+func scanQueue(
+	ctx context.Context,
+	files []string,
+	sem Semaphore,
+	cb *CircuitBreaker,
+	maxRetries int,
+	processFn func(context.Context, string) (string, error),
+) <-chan scanResult {
+	out := make(chan scanResult, len(files))
 
-// NewWorkerPool creates a new worker pool
-func NewWorkerPool(ctx context.Context, concurrency, maxRetries int, cb *CircuitBreaker) *WorkerPool {
-	poolCtx, cancel := context.WithCancel(ctx)
-	return &WorkerPool{
-		ctx:        poolCtx,
-		cancel:     cancel,
-		jobs:       make(chan string),
-		results:    make(chan scanResult, concurrency*2),
-		cb:         cb,
-		semaphore:  NewSemaphore(concurrency),
-		maxRetries: maxRetries,
-	}
-}
+	var wg sync.WaitGroup
+	for _, f := range files {
+		wg.Add(1)
+		go func(file string) {
+			defer wg.Done()
 
-// Start launches worker goroutines
-func (p *WorkerPool) Start(numWorkers int, processFn func(context.Context, string) (string, error)) {
-	for i := 0; i < numWorkers; i++ {
-		p.wg.Add(1)
-		go p.worker(processFn)
-	}
-}
+			start := time.Now()
 
-// worker is the main worker loop
-func (p *WorkerPool) worker(processFn func(context.Context, string) (string, error)) {
-	defer p.wg.Done()
-
-	for job := range p.jobs {
-		select {
-		case <-p.ctx.Done():
-			p.results <- scanResult{File: job, Error: p.ctx.Err()}
-			continue
-		default:
-		}
-
-		start := time.Now()
-
-		if !p.cb.Allow() {
-			p.results <- scanResult{
-				File:     job,
-				Error:    fmt.Errorf("circuit breaker open"),
-				Duration: time.Since(start),
+			if !cb.Allow() {
+				out <- scanResult{File: file, Error: fmt.Errorf("circuit breaker open"), Duration: time.Since(start)}
+				return
 			}
-			continue
-		}
 
-		out, err := p.runWithRetry(job, processFn)
+			outFile, err := runWithRetry(ctx, file, sem, maxRetries, processFn)
+			if err != nil {
+				cb.RecordFailure()
+			} else {
+				cb.RecordSuccess()
+			}
 
-		if err != nil {
-			p.cb.RecordFailure()
-		} else {
-			p.cb.RecordSuccess()
-		}
-
-		p.results <- scanResult{
-			File:       job,
-			OutputFile: out,
-			Error:      err,
-			Duration:   time.Since(start),
-		}
+			out <- scanResult{File: file, OutputFile: outFile, Error: err, Duration: time.Since(start)}
+		}(f)
 	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
 }
 
-// runWithRetry executes with retry logic
-func (p *WorkerPool) runWithRetry(job string, processFn func(context.Context, string) (string, error)) (string, error) {
+// runWithRetry wraps processFn with semaphore + exponential back-off retry
+func runWithRetry(
+	ctx context.Context,
+	file string,
+	sem Semaphore,
+	maxRetries int,
+	processFn func(context.Context, string) (string, error),
+) (string, error) {
 	var lastErr error
 
-	for attempt := 0; attempt <= p.maxRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		select {
-		case <-p.ctx.Done():
-			return "", p.ctx.Err()
+		case <-ctx.Done():
+			return "", ctx.Err()
 		default:
 		}
 
-		if err := p.semaphore.Acquire(p.ctx); err != nil {
-			return "", fmt.Errorf("semaphore acquire failed: %w", err)
+		if err := sem.Acquire(ctx); err != nil {
+			return "", fmt.Errorf("semaphore acquire: %w", err)
 		}
-
-		out, err := processFn(p.ctx, job)
-		p.semaphore.Release()
+		outFile, err := processFn(ctx, file)
+		sem.Release()
 
 		if err == nil {
-			return out, nil
+			return outFile, nil
 		}
-
 		lastErr = err
 
-		if !isRetryableError(err) || attempt >= p.maxRetries {
+		if !isRetryableError(err) || attempt >= maxRetries {
 			return "", err
 		}
 
 		backoff := calculateBackoff(attempt)
 		log.Warn().
-			Str("file", filepath.Base(job)).
+			Str("file", filepath.Base(file)).
 			Int("attempt", attempt+1).
 			Dur("backoff", backoff).
 			Err(err).
 			Msg("Retry")
 
 		select {
-		case <-p.ctx.Done():
-			return "", p.ctx.Err()
+		case <-ctx.Done():
+			return "", ctx.Err()
 		case <-time.After(backoff):
 		}
 	}
 
-	return "", fmt.Errorf("failed after %d attempts: %w", p.maxRetries+1, lastErr)
-}
-
-// SubmitBatch adds multiple jobs to the pool
-func (p *WorkerPool) SubmitBatch(jobs []string) {
-	for _, j := range jobs {
-		p.jobs <- j
-	}
-}
-
-// Close closes the job channel and waits for completion
-func (p *WorkerPool) Close() {
-	close(p.jobs)
-	p.wg.Wait()
-	close(p.results)
-}
-
-// Results returns the results channel
-func (p *WorkerPool) Results() <-chan scanResult {
-	return p.results
-}
-
-// Cancel cancels all workers
-func (p *WorkerPool) Cancel() {
-	p.cancel()
+	return "", fmt.Errorf("failed after %d attempts: %w", maxRetries+1, lastErr)
 }
 
 // zerologPrettySetup configures zerolog console output
@@ -369,15 +300,14 @@ func isRetryableError(err error) bool {
 		return false
 	}
 	errStr := strings.ToLower(err.Error())
-	retryablePatterns := []string{
+	for _, p := range []string{
 		"context deadline exceeded", "context canceled",
 		"connection refused", "connection reset",
 		"temporary failure", "timeout", "i/o timeout",
 		"no such host", "network", "connection",
 		"database is locked", "database locked",
 		"sqlite_busy", "sqlite_locked",
-	}
-	for _, p := range retryablePatterns {
+	} {
 		if strings.Contains(errStr, p) {
 			return true
 		}
@@ -394,21 +324,14 @@ func retryOperation(ctx context.Context, operation string, fn func() error) erro
 		default:
 		}
 
-		err := fn()
-		if err == nil {
+		if err := fn(); err == nil {
 			return nil
-		}
-		if attempt >= defaultMaxRetries || !isRetryableError(err) {
+		} else if attempt >= defaultMaxRetries || !isRetryableError(err) {
 			return err
 		}
 
 		backoff := calculateBackoff(attempt)
-		log.Warn().
-			Int("attempt", attempt+1).
-			Dur("backoff", backoff).
-			Str("operation", operation).
-			Err(err).
-			Msg("Retry failed, will retry")
+		log.Warn().Int("attempt", attempt+1).Dur("backoff", backoff).Str("operation", operation).Msg("Retry failed, will retry")
 
 		select {
 		case <-ctx.Done():
@@ -431,28 +354,15 @@ func processScanWithOutput(ctx context.Context, inputFile, outputDir, severity, 
 	out := outputFilenameCustom(inputFile, outputDir)
 	log.Info().Str("file", filepath.Base(inputFile)).Str("scanner", scanner).Msg("Scanning")
 
-	// Build trivy command args
-	args := []string{
-		trivyCmd, trivySubCmd,
-		"--input", inputFile,
-		"--format", "template",
-		"--template", templateContent,
-		"--output", out,
-		trivySkipDB, trivySkipJavaDB,
-	}
-
-	// Only add severity flag if explicitly specified
+	args := []string{trivyCmd, trivySubCmd, "--input", inputFile, "--format", "template", "--template", templateContent, "--output", out, trivySkipDB, trivySkipJavaDB}
 	if severity != "" {
 		args = append(args, "--severity", severity)
 	}
-
-	// Only add scanner flag if explicitly specified
 	if scanner != "" {
 		args = append(args, "--scanner", scanner)
 	}
 
 	cmd := exec.CommandContext(scanCtx, args[0], args[1:]...)
-
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if scanCtx.Err() == context.DeadlineExceeded {
@@ -460,7 +370,6 @@ func processScanWithOutput(ctx context.Context, inputFile, outputDir, severity, 
 		}
 		return "", fmt.Errorf("trivy failed: %w\n%s", err, output)
 	}
-
 	return out, nil
 }
 
@@ -526,16 +435,12 @@ func collectFiles(input string) ([]string, error) {
 
 // updateTrivyDB updates Trivy databases
 func updateTrivyDB(ctx context.Context) error {
-	databases := []struct {
-		name string
-		flag string
-	}{
+	databases := []struct{ name, flag string }{
 		{"Vulnerability", trivyDownloadDB},
 		{"Java", trivyDownloadJavaDB},
 	}
 
 	log.Info().Msg("Updating databases...")
-
 	for _, db := range databases {
 		select {
 		case <-ctx.Done():
@@ -551,7 +456,6 @@ func updateTrivyDB(ctx context.Context) error {
 			}
 			return nil
 		})
-
 		if err != nil {
 			log.Error().Str("database", db.name).Err(err).Msg("Update failed")
 			return err
@@ -573,7 +477,6 @@ func fileHash(filePath string) (string, error) {
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
-
 	hash := hex.EncodeToString(h.Sum(nil))
 	if len(hash) < hashLength {
 		return hash, nil
@@ -591,13 +494,11 @@ func outputFilenameCustom(inputFile, outputDir string) string {
 	return filepath.Join(outputDir, fmt.Sprintf("%s_%s-report.html", base, hash))
 }
 
-// main entry point
 func main() {
 	opts := options{}
 
 	flagSet := goflags.NewFlagSet()
 	flagSet.SetDescription("TrivyScan - Scan container images using Trivy")
-
 	flagSet.CreateGroup("input", "Input",
 		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar file or directory (required)"),
 	)
@@ -607,8 +508,7 @@ func main() {
 	flagSet.CreateGroup("configs", "Configs",
 		flagSet.IntVarP(&opts.Concurrency, "concurrency", "c", defaultConcurrency, "number of concurrent scans"),
 		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels"),
-		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanner to use (vuln,misconfig,secret,"+
-			"license)"),
+		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanner to use (vuln,misconfig,secret,license)"),
 		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip database update"),
 		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy check"),
 		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "r", defaultMaxRetries, "max retry attempts"),
@@ -663,35 +563,27 @@ func main() {
 		log.Fatal().Msgf("No .tar files in: %s", opts.Input)
 	}
 
-	log.Info().Str("version", version).Msg("TRIVY SCANNER")
-	log.Info().Msg("Starting scan")
-
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
 		log.Fatal().Err(err).Msg("Output dir error")
 	}
+
+	log.Info().Str("version", version).Int("files", len(files)).Int("concurrency", opts.Concurrency).Msg("Starting scan")
 
 	cb := NewCircuitBreaker(defaultCBThreshold, defaultCBTimeout)
 	cb.onStateChange = func(from, to string) {
 		log.Warn().Str("from", from).Str("to", to).Msg("Circuit breaker")
 	}
 
-	log.Info().Int("workers", opts.Concurrency).Int("files", len(files)).Msg("Starting scan...")
-
-	pool := NewWorkerPool(ctx, opts.Concurrency, opts.MaxRetries, cb)
-	pool.Start(opts.Concurrency, func(ctx context.Context, file string) (string, error) {
+	sem := NewSemaphore(opts.Concurrency)
+	results := scanQueue(ctx, files, sem, cb, opts.MaxRetries, func(ctx context.Context, file string) (string, error) {
 		return processScanWithOutput(ctx, file, opts.Output, opts.Severity, opts.Scanner)
 	})
-
-	go func() {
-		pool.SubmitBatch(files)
-		pool.Close()
-	}()
 
 	startTime := time.Now()
 	var successResults, failResults []scanResult
 	completed := 0
 
-	for result := range pool.Results() {
+	for result := range results {
 		completed++
 		if result.Error != nil {
 			failResults = append(failResults, result)
@@ -704,23 +596,16 @@ func main() {
 	}
 
 	elapsed := time.Since(startTime)
-
 	log.Info().Msg("SCAN SUMMARY")
 
 	for _, r := range successResults {
 		log.Info().Str("input", r.File).Str("output", r.OutputFile).Dur("duration", r.Duration).Msg("Success")
 	}
-
 	for _, r := range failResults {
 		log.Error().Str("input", r.File).Err(r.Error).Msg("Failed")
 	}
 
-	log.Info().
-		Dur("duration", elapsed).
-		Int("success", len(successResults)).
-		Int("failed", len(failResults)).
-		Int("total", len(files)).
-		Msg("Complete")
+	log.Info().Dur("duration", elapsed).Int("success", len(successResults)).Int("failed", len(failResults)).Int("total", len(files)).Msg("Complete")
 
 	if len(failResults) > 0 {
 		os.Exit(1)
