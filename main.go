@@ -337,10 +337,17 @@ func zerologPrettySetup() {
 }
 
 // ---------------------------------------------------------------------------
-// main
+// main / run
 // ---------------------------------------------------------------------------
 
 func main() {
+	zerologPrettySetup()
+	os.Exit(run())
+}
+
+// run contains all application logic and returns an exit code.
+// Using a separate function keeps main clean and ensures defers always execute.
+func run() int {
 	opts := options{}
 
 	flagSet := goflags.NewFlagSet()
@@ -362,18 +369,17 @@ func main() {
 		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version"),
 	)
 
-	zerologPrettySetup()
-
 	if err := flagSet.Parse(); err != nil {
 		log.Fatal().Err(err).Msg("Flag parse error")
 	}
 
 	if opts.Version {
 		fmt.Printf("TrivyScan version %s\n", version)
-		os.Exit(0)
+		return 0
 	}
 	if opts.Input == "" {
-		log.Fatal().Msg("Input required: -i file.tar OR -i ./directory")
+		log.Error().Msg("Input required: -i file.tar OR -i ./directory")
+		return 1
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -389,7 +395,8 @@ func main() {
 
 	if !opts.SkipTrivyCheck {
 		if err := checkTrivyInstalled(ctx); err != nil {
-			log.Fatal().Err(err).Msg("Trivy check failed")
+			log.Error().Err(err).Msg("Trivy check failed")
+			return 1
 		}
 	}
 
@@ -401,14 +408,17 @@ func main() {
 
 	files, err := collectFiles(opts.Input)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Error collecting files")
+		log.Error().Err(err).Msg("Error collecting files")
+		return 1
 	}
 	if len(files) == 0 {
-		log.Fatal().Msgf("No .tar files found in: %s", opts.Input)
+		log.Error().Msgf("No .tar files found in: %s", opts.Input)
+		return 1
 	}
 
 	if err := os.MkdirAll(opts.Output, 0755); err != nil {
-		log.Fatal().Err(err).Msg("Cannot create output directory")
+		log.Error().Err(err).Msg("Cannot create output directory")
+		return 1
 	}
 
 	log.Info().Str("version", version).Int("files", len(files)).Msg("Starting scan")
@@ -421,11 +431,9 @@ func main() {
 	)
 
 	for i, file := range files {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			log.Warn().Msg("Scan cancelled")
-			goto summary
-		default:
+			break
 		}
 
 		log.Info().Int("current", i+1).Int("total", len(files)).Str("file", filepath.Base(file)).Msg("Progress")
@@ -437,11 +445,11 @@ func main() {
 		case result.Skipped:
 			skippedResults = append(skippedResults, result)
 		default:
+			log.Error().Str("file", result.File).Err(result.Error).Msg("Failed, continuing to next file")
 			failResults = append(failResults, result)
 		}
 	}
 
-summary:
 	elapsed := time.Since(startTime)
 
 	log.Info().Msg("── SCAN SUMMARY ──────────────────────────────")
@@ -463,6 +471,7 @@ summary:
 		Msg("Complete")
 
 	if len(failResults) > 0 {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
