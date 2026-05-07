@@ -463,7 +463,7 @@ func run() int {
 		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory for HTML reports"),
 	)
 	flagSet.CreateGroup("configs", "Configs",
-		flagSet.StringVarP(&opts.Severity, "severity", "s", "MEDIUM,HIGH,CRITICAL", "severity levels"),
+		flagSet.StringVarP(&opts.Severity, "severity", "s", "", "severity levels"),
 		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanner to use (vuln,misconfig,secret,license)"),
 		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip database update"),
 		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy installation check"),
