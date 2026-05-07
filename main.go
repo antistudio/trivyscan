@@ -63,8 +63,23 @@ type options struct {
 	MaxRetries     int
 }
 
+// inputType describes what kind of input was provided
+type inputType int
+
+const (
+	inputTypeTar   inputType = iota // local .tar file
+	inputTypeImage                  // image reference e.g. nginx:latest
+	inputTypeDir                    // directory of .tar files
+)
+
+// scanTarget is a single unit of work for the scanner
+type scanTarget struct {
+	Input string
+	Kind  inputType
+}
+
 type scanResult struct {
-	File       string
+	Target     scanTarget
 	OutputFile string
 	Error      error
 	Duration   time.Duration
@@ -119,27 +134,27 @@ func isRetryableError(err error) bool {
 // Scan — sequential queue, one file at a time
 // ---------------------------------------------------------------------------
 
-// scanFile scans a single tar file with retry, returns a scanResult.
-func scanFile(ctx context.Context, file, outputDir, severity, scanner string, maxRetries int) scanResult {
+// scanTarget scans a single target with retry, returns a scanResult.
+func scanOne(ctx context.Context, target scanTarget, outputDir, severity, scanner string, maxRetries int) scanResult {
 	start := time.Now()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return scanResult{File: file, Error: ctx.Err(), Duration: time.Since(start)}
+			return scanResult{Target: target, Error: ctx.Err(), Duration: time.Since(start)}
 		default:
 		}
 
-		outFile, err := processScan(ctx, file, outputDir, severity, scanner)
+		outFile, err := processScan(ctx, target, outputDir, severity, scanner)
 		if err == nil {
-			return scanResult{File: file, OutputFile: outFile, Duration: time.Since(start)}
+			return scanResult{Target: target, OutputFile: outFile, Duration: time.Since(start)}
 		}
 
-		// Invalid image — skip immediately, no retry
-		if isInvalidImageError(err) {
-			log.Warn().Str("file", filepath.Base(file)).Msg("Skipped: not a valid Docker/OCI image tar")
-			return scanResult{File: file, Error: err, Duration: time.Since(start), Skipped: true}
+		// Invalid tar — skip immediately, no retry (not applicable to image refs)
+		if target.Kind == inputTypeTar && isInvalidImageError(err) {
+			log.Warn().Str("file", target.Input).Msg("Skipped: not a valid Docker/OCI image tar")
+			return scanResult{Target: target, Error: err, Duration: time.Since(start), Skipped: true}
 		}
 
 		lastErr = err
@@ -150,7 +165,7 @@ func scanFile(ctx context.Context, file, outputDir, severity, scanner string, ma
 
 		backoff := calculateBackoff(attempt)
 		log.Warn().
-			Str("file", filepath.Base(file)).
+			Str("input", target.Input).
 			Int("attempt", attempt+1).
 			Dur("backoff", backoff).
 			Err(err).
@@ -158,34 +173,41 @@ func scanFile(ctx context.Context, file, outputDir, severity, scanner string, ma
 
 		select {
 		case <-ctx.Done():
-			return scanResult{File: file, Error: ctx.Err(), Duration: time.Since(start)}
+			return scanResult{Target: target, Error: ctx.Err(), Duration: time.Since(start)}
 		case <-time.After(backoff):
 		}
 	}
 
-	return scanResult{File: file, Error: lastErr, Duration: time.Since(start)}
+	return scanResult{Target: target, Error: lastErr, Duration: time.Since(start)}
 }
 
-// processScan runs trivy against one tar file and writes the HTML report.
-func processScan(ctx context.Context, inputFile, outputDir, severity, scanner string) (string, error) {
+// processScan runs trivy against a scanTarget and writes the HTML report.
+func processScan(ctx context.Context, target scanTarget, outputDir, severity, scanner string) (string, error) {
 	scanCtx, cancel := context.WithTimeout(ctx, defaultScanTimeout)
 	defer cancel()
 
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
-		return "", fmt.Errorf("file not found: %s", inputFile)
-	}
-
-	outFile := outputFilenameCustom(inputFile, outputDir)
-	log.Info().Str("file", filepath.Base(inputFile)).Msg("Scanning")
+	outFile := outputFilenameCustom(target.Input, outputDir)
+	log.Info().Str("input", target.Input).Str("kind", target.kindString()).Msg("Scanning")
 
 	args := []string{
 		trivyCmd, trivySubCmd,
-		"--input", inputFile,
 		"--format", "template",
 		"--template", templateContent,
 		"--output", outFile,
 		trivySkipDB, trivySkipJavaDB,
 	}
+
+	switch target.Kind {
+	case inputTypeTar:
+		if _, err := os.Stat(target.Input); os.IsNotExist(err) {
+			return "", fmt.Errorf("file not found: %s", target.Input)
+		}
+		args = append(args, "--input", target.Input)
+	case inputTypeImage:
+		// image reference is positional arg, no --input flag
+		args = append(args, target.Input)
+	}
+
 	if severity != "" {
 		args = append(args, "--severity", severity)
 	}
@@ -201,6 +223,17 @@ func processScan(ctx context.Context, inputFile, outputDir, severity, scanner st
 		return "", fmt.Errorf("trivy failed: %w\n%s", err, output)
 	}
 	return outFile, nil
+}
+
+func (t scanTarget) kindString() string {
+	switch t.Kind {
+	case inputTypeTar:
+		return "tar"
+	case inputTypeImage:
+		return "image"
+	default:
+		return "unknown"
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -253,31 +286,44 @@ func updateTrivyDB(ctx context.Context) error {
 }
 
 // ---------------------------------------------------------------------------
-// File collection
+// Input resolution
 // ---------------------------------------------------------------------------
 
 const maxWalkDepth = 5
 
-func collectFiles(input string) ([]string, error) {
+// resolveTargets classifies the input and returns a list of scanTargets.
+//
+//   - image reference (nginx:latest, registry/img@sha256:...) → single inputTypeImage
+//   - existing .tar file                                       → single inputTypeTar
+//   - existing directory                                       → walk for .tar files
+func resolveTargets(input string) ([]scanTarget, error) {
 	info, err := os.Stat(input)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Path does not exist on disk — treat as image reference
+			if !isImageReference(input) {
+				return nil, fmt.Errorf("input %q not found on disk and does not look like an image reference", input)
+			}
+			log.Info().Str("image", input).Msg("Detected image reference")
+			return []scanTarget{{Input: input, Kind: inputTypeImage}}, nil
+		}
 		return nil, fmt.Errorf("cannot access %q: %w", input, err)
 	}
 
-	// Single file input
+	// Single .tar file
 	if !info.IsDir() {
 		if !strings.HasSuffix(strings.ToLower(input), ".tar") {
 			return nil, fmt.Errorf("not a .tar file: %s", input)
 		}
-		return []string{input}, nil
+		return []scanTarget{{Input: input, Kind: inputTypeTar}}, nil
 	}
 
-	// Directory input — walk up to maxWalkDepth levels using fastwalk
+	// Directory — walk up to maxWalkDepth levels
 	baseDepth := strings.Count(filepath.Clean(input), string(os.PathSeparator))
 
 	var (
-		files []string
-		mu    sync.Mutex
+		targets []scanTarget
+		mu      sync.Mutex
 	)
 
 	conf := fastwalk.Config{Follow: false}
@@ -286,7 +332,6 @@ func collectFiles(input string) ([]string, error) {
 			log.Warn().Str("path", path).Err(err).Msg("Skipping inaccessible path")
 			return nil
 		}
-
 		depth := strings.Count(filepath.Clean(path), string(os.PathSeparator)) - baseDepth
 		if d.IsDir() {
 			if depth >= maxWalkDepth {
@@ -295,10 +340,9 @@ func collectFiles(input string) ([]string, error) {
 			}
 			return nil
 		}
-
 		if strings.HasSuffix(strings.ToLower(d.Name()), ".tar") {
 			mu.Lock()
-			files = append(files, path)
+			targets = append(targets, scanTarget{Input: path, Kind: inputTypeTar})
 			mu.Unlock()
 		}
 		return nil
@@ -307,8 +351,26 @@ func collectFiles(input string) ([]string, error) {
 		return nil, fmt.Errorf("cannot walk directory: %w", err)
 	}
 
-	log.Info().Int("count", len(files)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar files")
-	return files, nil
+	log.Info().Int("count", len(targets)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar files")
+	return targets, nil
+}
+
+// isImageReference returns true if s looks like a container image reference:
+// optional registry host, image name, and optional tag or digest.
+// Examples: nginx, nginx:1.25, registry.io/myapp:latest, repo/img@sha256:abc
+func isImageReference(s string) bool {
+	// Must not be an existing path — caller already checked os.Stat
+	// Simple heuristic: contains ":" (tag) or "@" (digest), or is a bare name
+	// with no path separator characters that would indicate a filesystem path.
+	if strings.Contains(s, "@") {
+		return true // digest reference
+	}
+	if strings.Contains(s, ":") {
+		// Could be "image:tag" or "/path/to/file" — reject if it looks like a Windows abs path
+		return !strings.HasSuffix(strings.ToLower(s), ".tar")
+	}
+	// Bare name like "nginx" or "myrepo/myimage" — valid if no OS path separators
+	return !strings.ContainsAny(s, `\/`)
 }
 
 // ---------------------------------------------------------------------------
@@ -341,12 +403,24 @@ func fileHash(filePath string) (string, error) {
 	return hash[:hashLength], nil
 }
 
-func outputFilenameCustom(inputFile, outputDir string) string {
-	hash, err := fileHash(inputFile)
-	if err != nil {
-		hash = fmt.Sprintf("%x", time.Now().Unix())[:hashLength]
+func outputFilenameCustom(input, outputDir string) string {
+	// For image references (e.g. nginx:latest), hash the string itself
+	// since there is no file to read.
+	var hash string
+	if _, err := os.Stat(input); err == nil {
+		h, err := fileHash(input)
+		if err == nil {
+			hash = h
+		}
 	}
-	base := strings.TrimSuffix(filepath.Base(inputFile), filepath.Ext(inputFile))
+	if hash == "" {
+		h := sha256.Sum256([]byte(input))
+		hash = hex.EncodeToString(h[:])[:hashLength]
+	}
+
+	// Sanitize input name for use in filename (replace / : @ with _)
+	base := strings.TrimSuffix(filepath.Base(input), filepath.Ext(input))
+	base = strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(base)
 	return filepath.Join(outputDir, fmt.Sprintf("%s_%s-report.html", base, hash))
 }
 
@@ -436,13 +510,13 @@ func run() int {
 		}
 	}
 
-	files, err := collectFiles(opts.Input)
+	targets, err := resolveTargets(opts.Input)
 	if err != nil {
-		log.Error().Err(err).Msg("Error collecting files")
+		log.Error().Err(err).Msg("Error resolving input")
 		return 1
 	}
-	if len(files) == 0 {
-		log.Error().Msgf("No .tar files found in: %s", opts.Input)
+	if len(targets) == 0 {
+		log.Error().Msgf("No scannable targets found in: %s", opts.Input)
 		return 1
 	}
 
@@ -451,7 +525,7 @@ func run() int {
 		return 1
 	}
 
-	log.Info().Str("version", version).Int("files", len(files)).Msg("Starting scan")
+	log.Info().Str("version", version).Int("targets", len(targets)).Msg("Starting scan")
 
 	startTime := time.Now()
 	var (
@@ -460,22 +534,22 @@ func run() int {
 		failResults    []scanResult
 	)
 
-	for i, file := range files {
+	for i, target := range targets {
 		if ctx.Err() != nil {
 			log.Warn().Msg("Scan cancelled")
 			break
 		}
 
-		log.Info().Int("current", i+1).Int("total", len(files)).Str("file", filepath.Base(file)).Msg("Progress")
+		log.Info().Int("current", i+1).Int("total", len(targets)).Str("input", target.Input).Str("kind", target.kindString()).Msg("Progress")
 
-		result := scanFile(ctx, file, opts.Output, opts.Severity, opts.Scanner, opts.MaxRetries)
+		result := scanOne(ctx, target, opts.Output, opts.Severity, opts.Scanner, opts.MaxRetries)
 		switch {
 		case result.Error == nil:
 			successResults = append(successResults, result)
 		case result.Skipped:
 			skippedResults = append(skippedResults, result)
 		default:
-			log.Error().Str("file", result.File).Err(result.Error).Msg("Failed, continuing to next file")
+			log.Error().Str("input", result.Target.Input).Err(result.Error).Msg("Failed, continuing to next target")
 			failResults = append(failResults, result)
 		}
 	}
@@ -484,20 +558,20 @@ func run() int {
 
 	log.Info().Msg("── SCAN SUMMARY ──────────────────────────────")
 	for _, r := range successResults {
-		log.Info().Str("input", r.File).Str("output", r.OutputFile).Dur("duration", r.Duration).Msg("OK")
+		log.Info().Str("input", r.Target.Input).Str("output", r.OutputFile).Dur("duration", r.Duration).Msg("OK")
 	}
 	for _, r := range skippedResults {
-		log.Warn().Str("input", r.File).Msg("SKIPPED (invalid Docker/OCI tar)")
+		log.Warn().Str("input", r.Target.Input).Msg("SKIPPED (invalid Docker/OCI tar)")
 	}
 	for _, r := range failResults {
-		log.Error().Str("input", r.File).Err(r.Error).Msg("FAILED")
+		log.Error().Str("input", r.Target.Input).Err(r.Error).Msg("FAILED")
 	}
 	log.Info().
 		Dur("duration", elapsed).
 		Int("success", len(successResults)).
 		Int("skipped", len(skippedResults)).
 		Int("failed", len(failResults)).
-		Int("total", len(files)).
+		Int("total", len(targets)).
 		Msg("Complete")
 
 	if len(failResults) > 0 {
