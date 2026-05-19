@@ -20,7 +20,7 @@ require (
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/projectdiscovery/blackrock v0.0.1 // indirect
-	github.com/projectdiscovery/utils v0.10.1 // indirect
+	github.com/projectdiscovery/utils v0.11.0 // indirect
 	github.com/saintfish/chardet v0.0.0-20230101081208-5e3ef4b5456d // indirect
 	github.com/tidwall/gjson v1.19.0 // indirect
 	github.com/tidwall/match v1.2.0 // indirect
