@@ -153,7 +153,7 @@ func scanOne(ctx context.Context, target scanTarget, outputDir, severity, scanne
 
 		// Invalid tar — skip immediately, no retry (not applicable to image refs)
 		if target.Kind == inputTypeTar && isInvalidImageError(err) {
-			log.Warn().Str("file", target.Input).Msg("Skipped: not a valid Docker/OCI image tar")
+			log.Warn().Str("file", target.Input).Msg("Skipped: not a valid Docker/OCI image (tar/tar.gz)")
 			return scanResult{Target: target, Error: err, Duration: time.Since(start), Skipped: true}
 		}
 
@@ -291,6 +291,17 @@ func updateTrivyDB(ctx context.Context) error {
 
 const maxWalkDepth = 5
 
+// isTarFile returns true if the filename ends with .tar or .tar.gz.
+func isTarFile(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tar")
+}
+
+// isTarGzFile returns true if the filename ends with .tar.gz.
+func isTarGzFile(name string) bool {
+	return strings.HasSuffix(strings.ToLower(name), ".tar.gz")
+}
+
 // resolveTargets classifies the input and returns a list of scanTargets.
 //
 //   - image reference (nginx:latest, registry/img@sha256:...) → single inputTypeImage
@@ -310,10 +321,10 @@ func resolveTargets(input string) ([]scanTarget, error) {
 		return nil, fmt.Errorf("cannot access %q: %w", input, err)
 	}
 
-	// Single .tar file
+	// Single .tar / .tar.gz file
 	if !info.IsDir() {
-		if !strings.HasSuffix(strings.ToLower(input), ".tar") {
-			return nil, fmt.Errorf("not a .tar file: %s", input)
+		if !isTarFile(input) {
+			return nil, fmt.Errorf("not a .tar or .tar.gz file: %s", input)
 		}
 		return []scanTarget{{Input: input, Kind: inputTypeTar}}, nil
 	}
@@ -340,7 +351,7 @@ func resolveTargets(input string) ([]scanTarget, error) {
 			}
 			return nil
 		}
-		if strings.HasSuffix(strings.ToLower(d.Name()), ".tar") {
+		if isTarFile(d.Name()) {
 			mu.Lock()
 			targets = append(targets, scanTarget{Input: path, Kind: inputTypeTar})
 			mu.Unlock()
@@ -351,7 +362,7 @@ func resolveTargets(input string) ([]scanTarget, error) {
 		return nil, fmt.Errorf("cannot walk directory: %w", err)
 	}
 
-	log.Info().Int("count", len(targets)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar files")
+	log.Info().Int("count", len(targets)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar/.tar.gz files")
 	return targets, nil
 }
 
@@ -366,8 +377,8 @@ func isImageReference(s string) bool {
 		return true // digest reference
 	}
 	if strings.Contains(s, ":") {
-		// Could be "image:tag" or "/path/to/file" — reject if it looks like a Windows abs path
-		return !strings.HasSuffix(strings.ToLower(s), ".tar")
+		// Could be "image:tag" or "/path/to/file" — reject if it looks like a tar file
+		return !isTarFile(s)
 	}
 	// Bare name like "nginx" or "myrepo/myimage" — valid if no OS path separators
 	return !strings.ContainsAny(s, `\/`)
@@ -419,7 +430,12 @@ func outputFilenameCustom(input, outputDir string) string {
 	}
 
 	// Sanitize input name for use in filename (replace / : @ with _)
-	base := strings.TrimSuffix(filepath.Base(input), filepath.Ext(input))
+	base := filepath.Base(input)
+	if strings.HasSuffix(strings.ToLower(base), ".tar.gz") {
+		base = base[:len(base)-7] // strip .tar.gz (case-sensitive to preserve original)
+	} else {
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+	}
 	base = strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(base)
 	return filepath.Join(outputDir, fmt.Sprintf("%s_%s-report.html", base, hash))
 }
@@ -457,7 +473,7 @@ func run() int {
 	flagSet := goflags.NewFlagSet()
 	flagSet.SetDescription("TrivyScan - Scan container images using Trivy")
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar file or directory (required)"),
+		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar/.tar.gz file or directory (required)"),
 	)
 	flagSet.CreateGroup("output", "Output",
 		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory for HTML reports"),
@@ -482,7 +498,7 @@ func run() int {
 		return 0
 	}
 	if opts.Input == "" {
-		log.Error().Msg("Input required: -i file.tar OR -i ./directory")
+		log.Error().Msg("Input required: -i file.tar OR -i file.tar.gz OR -i ./directory")
 		return 1
 	}
 
