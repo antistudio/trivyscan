@@ -47,7 +47,17 @@ chmod +x install.sh
 ./install.sh
 ```
 
-### Windows
+### Windows (remote — one-liner)
+
+Open PowerShell as **Administrator** and run:
+
+```powershell
+irm https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.ps1 | iex
+```
+
+This downloads the latest release and installs everything automatically.
+
+### Windows (manual)
 
 **Step 1:** Unzip `trivyscan_<version>_amd64.zip`
 

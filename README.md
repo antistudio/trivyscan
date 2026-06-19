@@ -19,9 +19,29 @@ A high-performance, concurrent container image vulnerability scanner with profes
 
 ### Install TrivyScan
 
+#### Go
+
 ```bash
 go install github.com/anhnmt/trivyscan@latest
 ```
+
+#### Windows (one-liner)
+
+Open PowerShell as **Administrator** and run:
+
+```powershell
+irm https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.ps1 | iex
+```
+
+This downloads the latest release, installs Trivy + TrivyScan to `C:\Program Files\`, and adds both to `PATH`.
+
+#### Linux / macOS
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.sh | sudo bash
+```
+
+For manual installation and more details, see [INSTALL.md](INSTALL.md).
 
 ## Quick Start
 
