@@ -54,7 +54,7 @@ trivyscan -i nginx.tar -o ./reports
 # Scan multiple images
 trivyscan -i image1.tar,image2.tar,image3.tar -o ./reports
 
-# Scan folder (all .tar files)
+# Scan folder (all .tar/.tar.gz/.tgz files)
 trivyscan -i ./images -o ./reports
 
 # Custom configuration
@@ -98,7 +98,7 @@ trivyscan -i production.tar -o ./reports -s CRITICAL,HIGH
 trivyscan -i *.tar -o ./reports -c 10
 ```
 
-### Scan Folder (all .tar files)
+### Scan Folder (all .tar/.tar.gz/.tgz files)
 
 ```bash
 trivyscan -i ./images -o ./reports

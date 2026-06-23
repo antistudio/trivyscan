@@ -153,7 +153,7 @@ func scanOne(ctx context.Context, target scanTarget, outputDir, severity, scanne
 
 		// Invalid tar — skip immediately, no retry (not applicable to image refs)
 		if target.Kind == inputTypeTar && isInvalidImageError(err) {
-			log.Warn().Str("file", target.Input).Msg("Skipped: not a valid Docker/OCI image (tar/tar.gz)")
+			log.Warn().Str("file", target.Input).Msg("Skipped: not a valid Docker/OCI image (tar/tar.gz/tgz)")
 			return scanResult{Target: target, Error: err, Duration: time.Since(start), Skipped: true}
 		}
 
@@ -291,15 +291,16 @@ func updateTrivyDB(ctx context.Context) error {
 
 const maxWalkDepth = 5
 
-// isTarFile returns true if the filename ends with .tar or .tar.gz.
+// isTarFile returns true if the filename ends with .tar, .tar.gz, or .tgz.
 func isTarFile(name string) bool {
 	lower := strings.ToLower(name)
-	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tar")
+	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") || strings.HasSuffix(lower, ".tar")
 }
 
-// isTarGzFile returns true if the filename ends with .tar.gz.
+// isTarGzFile returns true if the filename ends with .tar.gz or .tgz.
 func isTarGzFile(name string) bool {
-	return strings.HasSuffix(strings.ToLower(name), ".tar.gz")
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz")
 }
 
 // resolveTargets classifies the input and returns a list of scanTargets.
@@ -324,7 +325,7 @@ func resolveTargets(input string) ([]scanTarget, error) {
 	// Single .tar / .tar.gz file
 	if !info.IsDir() {
 		if !isTarFile(input) {
-			return nil, fmt.Errorf("not a .tar or .tar.gz file: %s", input)
+			return nil, fmt.Errorf("not a .tar, .tar.gz, or .tgz file: %s", input)
 		}
 		return []scanTarget{{Input: input, Kind: inputTypeTar}}, nil
 	}
@@ -362,7 +363,7 @@ func resolveTargets(input string) ([]scanTarget, error) {
 		return nil, fmt.Errorf("cannot walk directory: %w", err)
 	}
 
-	log.Info().Int("count", len(targets)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar/.tar.gz files")
+	log.Info().Int("count", len(targets)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar/.tar.gz/.tgz files")
 	return targets, nil
 }
 
@@ -431,8 +432,11 @@ func outputFilenameCustom(input, outputDir string) string {
 
 	// Sanitize input name for use in filename (replace / : @ with _)
 	base := filepath.Base(input)
-	if strings.HasSuffix(strings.ToLower(base), ".tar.gz") {
+	lowerBase := strings.ToLower(base)
+	if strings.HasSuffix(lowerBase, ".tar.gz") {
 		base = base[:len(base)-7] // strip .tar.gz (case-sensitive to preserve original)
+	} else if strings.HasSuffix(lowerBase, ".tgz") {
+		base = base[:len(base)-4] // strip .tgz (case-sensitive to preserve original)
 	} else {
 		base = strings.TrimSuffix(base, filepath.Ext(base))
 	}
@@ -473,7 +477,7 @@ func run() int {
 	flagSet := goflags.NewFlagSet()
 	flagSet.SetDescription("TrivyScan - Scan container images using Trivy")
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar/.tar.gz file or directory (required)"),
+		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar/.tar.gz/.tgz file or directory (required)"),
 	)
 	flagSet.CreateGroup("output", "Output",
 		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory for HTML reports"),
@@ -498,7 +502,7 @@ func run() int {
 		return 0
 	}
 	if opts.Input == "" {
-		log.Error().Msg("Input required: -i file.tar OR -i file.tar.gz OR -i ./directory")
+		log.Error().Msg("Input required: -i file.tar OR -i file.tar.gz OR -i file.tgz OR -i ./directory")
 		return 1
 	}
 
