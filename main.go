@@ -67,9 +67,8 @@ type options struct {
 type inputType int
 
 const (
-	inputTypeTar   inputType = iota // local .tar file
+	inputTypeTar   inputType = iota // local .tar/.tar.gz/.tgz file
 	inputTypeImage                  // image reference e.g. nginx:latest
-	inputTypeDir                    // directory of .tar files
 )
 
 // scanTarget is a single unit of work for the scanner
@@ -295,12 +294,6 @@ const maxWalkDepth = 5
 func isTarFile(name string) bool {
 	lower := strings.ToLower(name)
 	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") || strings.HasSuffix(lower, ".tar")
-}
-
-// isTarGzFile returns true if the filename ends with .tar.gz or .tgz.
-func isTarGzFile(name string) bool {
-	lower := strings.ToLower(name)
-	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz")
 }
 
 // resolveTargets classifies the input and returns a list of scanTargets.
