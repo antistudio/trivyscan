@@ -19,11 +19,13 @@ A high-performance, concurrent container image vulnerability scanner with profes
 
 ### Install TrivyScan
 
-#### Go
+#### Go (build from source)
 
 ```bash
-go install github.com/anhnmt/trivyscan@latest
+go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o trivyscan .
 ```
+
+> **Note:** Without `-ldflags`, `trivyscan -v` will show `dev`. The version is injected at build time via linker flags.
 
 #### Windows (one-liner)
 

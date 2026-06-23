@@ -189,10 +189,17 @@ function Install-TrivyScan {
 
 function Get-TrivyScanBinary {
     # Try local mode first: check if binary exists alongside install.ps1
-    $localBinary = Join-Path $ScriptDir "trivyscan_windows.exe"
-    if (Test-Path $localBinary) {
-        Write-Host "[INFO] Found local binary: $localBinary"
-        return $localBinary
+    $candidates = @(
+        "trivyscan_windows.exe",
+        "trivyscan.exe",
+        "trivyscan"
+    )
+    foreach ($name in $candidates) {
+        $localBinary = Join-Path $ScriptDir $name
+        if (Test-Path $localBinary) {
+            Write-Host "[INFO] Found local binary: $localBinary"
+            return $localBinary
+        }
     }
 
     # Remote mode: download from GitHub release
@@ -295,23 +302,45 @@ Write-Host "[INFO] Checking TrivyScan..."
 $SourceExe = Get-TrivyScanBinary
 $TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
 
+# Rename trivyscan_windows.exe -> trivyscan.exe in local dir
+$localWinBinary = Join-Path $ScriptDir "trivyscan_windows.exe"
+$localRenamed   = Join-Path $ScriptDir "trivyscan.exe"
+if ((Test-Path $localWinBinary) -and (-not (Test-Path $localRenamed))) {
+    try {
+        Rename-Item $localWinBinary "trivyscan.exe" -Force
+        Write-Green "[OK] Renamed trivyscan_windows.exe -> trivyscan.exe"
+        if ($SourceExe -eq $localWinBinary) {
+            $SourceExe = $localRenamed
+        }
+    } catch {
+        Write-Yellow "[WARN] Cannot rename local binary: $_"
+    }
+}
+
 $currentTrivyscan = $null
 
 if (Test-Path $TargetExe) {
     $currentTrivyscan = (& $TargetExe --version 2>$null) | Select-Object -First 1
 }
 
+# Check if downloaded binary is newer than installed
+$shouldInstall = $false
 if (-not $SourceExe) {
     Write-Red "[ERROR] Cannot locate trivyscan binary"
-} elseif (-not $Force -and $currentTrivyscan) {
-    Write-Green "[OK] TrivyScan already installed"
+} elseif ($Force) {
+    $shouldInstall = $true
+} elseif (-not $currentTrivyscan) {
+    # Not installed yet
+    $shouldInstall = $true
+} elseif ($SourceExe -ne $TargetExe -and (Test-Path $SourceExe)) {
+    # Remote mode: always overwrite with latest download
+    $shouldInstall = $true
+    Write-Yellow "[INFO] New version available, updating..."
 } else {
-    if ($currentTrivyscan) {
-        Write-Host "[INFO] Reinstalling TrivyScan..."
-    } else {
-        Write-Host "[INFO] TrivyScan not found, installing..."
-    }
+    Write-Green "[OK] TrivyScan already installed"
+}
 
+if ($shouldInstall) {
     if (Install-TrivyScan -SourceExe $SourceExe -TargetExe $TargetExe) {
         Write-Green "[OK] TrivyScan installed/updated"
         $trivyscanUpdated = $true
