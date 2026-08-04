@@ -49,3 +49,5 @@ devenv.local.yaml
 *-report.html
 
 /dist
+
+.kilo/
