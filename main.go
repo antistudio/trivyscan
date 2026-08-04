@@ -45,6 +45,7 @@ const (
 
 const (
 	defaultMaxRetries        = 3
+	defaultMaxDepth          = 3
 	defaultInitialBackoff    = 2 * time.Second
 	defaultMaxBackoff        = 30 * time.Second
 	defaultBackoffMultiplier = 2.0
@@ -57,10 +58,12 @@ type options struct {
 	Output         string
 	Severity       string
 	Scanner        string
+	OnlyUpdate     bool
 	SkipDBUpdate   bool
 	SkipTrivyCheck bool
 	Version        bool
 	MaxRetries     int
+	MaxDepth       int
 }
 
 // inputType describes what kind of input was provided
@@ -478,9 +481,11 @@ func run() int {
 	flagSet.CreateGroup("configs", "Configs",
 		flagSet.StringVarP(&opts.Severity, "severity", "s", "", "severity levels"),
 		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanner to use (vuln,misconfig,secret,license)"),
-		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "u", false, "skip database update"),
-		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "t", false, "skip trivy installation check"),
-		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "r", defaultMaxRetries, "max retry attempts"),
+		flagSet.BoolVarP(&opts.OnlyUpdate, "update", "u", false, "only update database and exit"),
+		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "sd", false, "skip database update"),
+		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "st", false, "skip trivy installation check"),
+		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "rt", defaultMaxRetries, "max retry attempts"),
+		flagSet.IntVarP(&opts.MaxDepth, "max-depth", "md", defaultMaxDepth, "max depth"),
 	)
 	flagSet.CreateGroup("info", "Info",
 		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version"),
@@ -494,13 +499,22 @@ func run() int {
 		fmt.Printf("TrivyScan version %s\n", version)
 		return 0
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if opts.OnlyUpdate {
+		if err := updateTrivyDB(ctx); err != nil {
+			log.Error().Err(err).Msg("DB update failed")
+			return 1
+		}
+		return 0
+	}
+
 	if opts.Input == "" {
 		log.Error().Msg("Input required: -i file.tar OR -i file.tar.gz OR -i file.tgz OR -i ./directory")
 		return 1
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
