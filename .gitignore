@@ -48,6 +48,12 @@ devenv.local.yaml
 *.tar
 *-report.html
 
+# trivyscan output (default -o .)
+/json/
+/html/
+/summary.html
+
 /dist
 
 .kilo/
+testdata/

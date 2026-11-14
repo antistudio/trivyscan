@@ -3,8 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  {{- if . }}
-  <title>Trivy Security Report - {{ escapeXML ( index . 0 ).Target }}</title>
+  <title>Trivy Security Report{{ if . }} - {{ escapeXML ( index . 0 ).Target }}{{ end }}</title>
   <style>
     :root {
       /* Sentra Color Palette */
@@ -646,6 +645,7 @@
       background: var(--bd);
     }
   </style>
+  {{- if . }}
 </head>
 <body>
 <div class="container">

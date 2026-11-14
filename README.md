@@ -1,15 +1,17 @@
 # TrivyScan
 
-A high-performance, concurrent container image vulnerability scanner with professional HTML reports.
+A container image vulnerability scanner built on Trivy, with professional HTML reports and a multi-image summary.
 
 ## Features
 
-- 🚀 **Concurrent Scanning** - Scan multiple images simultaneously
-- 📊 **Beautiful Reports** - Sentra-inspired interactive HTML reports
+- 📁 **Batch Scanning** - Scan a whole directory of `.tar`/`.tar.gz`/`.tgz` images in one command
+- 📊 **Beautiful Reports** - Sentra-inspired interactive HTML report per image
+- 📋 **Summary Page** - One `summary.html` with severity counts for every image
+- 🗂️ **JSON First** - Raw Trivy JSON kept for every image; HTML is rendered from it
+- ⚡ **Incremental** - Unchanged images are not rescanned until the Trivy DB changes
 - 🔄 **Auto Updates** - Automatic vulnerability database updates
 - 📦 **Single Binary** - Self-contained with embedded templates
-- 🎯 **Smart Filtering** - Filter by severity levels
-- 🔒 **Thread-Safe** - Deadlock-free concurrent processing
+- 🎯 **Smart Filtering** - Filter by severity levels without rescanning
 
 ## Installation
 
@@ -51,14 +53,14 @@ For manual installation and more details, see [INSTALL.md](INSTALL.md).
 # Scan single image
 trivyscan -i nginx.tar -o ./reports
 
-# Scan multiple images
-trivyscan -i image1.tar,image2.tar,image3.tar -o ./reports
+# Scan image reference
+trivyscan -i nginx:1.25 -o ./reports
 
-# Scan folder (all .tar/.tar.gz/.tgz files)
+# Scan folder (all .tar/.tar.gz/.tgz files) → per-image reports + summary.html
 trivyscan -i ./images -o ./reports
 
-# Custom configuration
-trivyscan -i app.tar -o ./reports -c 5 -s CRITICAL,HIGH
+# Show only critical/high (re-renders from JSON, no rescan)
+trivyscan -i ./images -o ./reports -s CRITICAL,HIGH
 ```
 
 ## Usage
@@ -71,12 +73,18 @@ trivyscan [flags]
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `--input` | `-i` | Input image file, comma-separated files, or directory | *required* |
-| `--output` | `-o` | Output directory for reports | `.` |
-| `--concurrency` | `-c` | Number of concurrent workers | `3` |
-| `--severity` | `-s` | Severity levels to scan | `MEDIUM,HIGH,CRITICAL` |
-| `--skip-db-update` | `-u` | Skip database update | `false` |
-| `--skip-trivy-check` | `-t` | Skip Trivy installation check | `false` |
+| `--input` | `-i` | Input `.tar`/`.tar.gz`/`.tgz` file, directory, or image reference | *required* |
+| `--output` | `-o` | Output directory (`json/`, `html/`, `summary.html`) | `.` |
+| `--severity` | `-s` | Severity levels shown in reports (render-time filter) | all |
+| `--scanner` | `-S` | Trivy scanners (`vuln,misconfig,secret,license`) | Trivy default |
+| `--force` | `-f` | Rescan even if an up-to-date JSON report exists | `false` |
+| `--timeout` | `-t` | Timeout per scan | `10m` |
+| `--max-retries` | `-rt` | Max retry attempts for transient errors | `3` |
+| `--max-depth` | `-md` | Max directory depth when scanning a folder | `5` |
+| `--update` | `-u` | Only update the Trivy databases and exit | `false` |
+| `--skip-db-update` | `-sd` | Skip database update | `false` |
+| `--skip-trivy-check` | `-st` | Skip Trivy installation check | `false` |
+| `--version` | `-v` | Show version | `false` |
 
 ## Examples
 
@@ -92,12 +100,6 @@ trivyscan -i myapp.tar -o ./reports
 trivyscan -i production.tar -o ./reports -s CRITICAL,HIGH
 ```
 
-### Batch Scanning with High Concurrency
-
-```bash
-trivyscan -i *.tar -o ./reports -c 10
-```
-
 ### Scan Folder (all .tar/.tar.gz/.tgz files)
 
 ```bash
@@ -107,22 +109,31 @@ trivyscan -i ./images -o ./reports
 ### CI/CD (Skip DB Update)
 
 ```bash
-trivyscan -i app.tar -o ./reports -u -s CRITICAL,HIGH
+trivyscan -i app.tar -o ./reports -sd -s CRITICAL,HIGH
 ```
 
 ## Output
 
-Reports are generated with the format: `{basename}-{hash}-report.html`
+Each image is scanned once by Trivy into JSON; the HTML pages are rendered from that JSON.
 
-**Example:**
 ```
 ./reports/
-├── nginx-a3f9c2-report.html
-├── api-server-7b8d1e-report.html
-└── frontend-5e2f4a-report.html
+├── summary.html                  # all images: OS, severity counts, link to detail page
+├── json/
+│   ├── nginx_a3f9c2.json         # full Trivy JSON (all severities)
+│   └── api-server_7b8d1e.json
+└── html/
+    ├── nginx_a3f9c2.html         # detail report
+    └── api-server_7b8d1e.html
 ```
 
-The 6-character hash ensures unique filenames for each scan.
+- File names are `{basename}_{hash}`, where the 6-character hash is taken from the tar's content
+  (or from the reference string for image references).
+- JSON always contains every severity; `-s` only filters what the HTML pages show.
+- On the next run, a tar whose JSON is newer than the Trivy DB is not rescanned, only re-rendered.
+  Changing `-s` is therefore instant. Use `--force` to rescan anyway (e.g. after changing `-S`).
+- `summary.html` also lists reports from earlier runs that are still in `json/`.
+- `json/` and `html/` are output artifacts; add them to `.gitignore` if the output directory is inside a repository.
 
 ## CI/CD Integration
 
@@ -138,7 +149,7 @@ The 6-character hash ensures unique filenames for each scan.
   uses: actions/upload-artifact@v3
   with:
     name: security-reports
-    path: ./reports/*.html
+    path: ./reports/
 ```
 
 ### GitLab CI
@@ -150,18 +161,8 @@ security-scan:
     - trivyscan -i image.tar -o ./reports -s CRITICAL,HIGH
   artifacts:
     paths:
-      - ./reports/*.html
+      - ./reports/
 ```
-
-## Performance Tips
-
-| CPU Cores | Recommended Workers |
-|-----------|---------------------|
-| 2-4 | 2-3 |
-| 4-8 | 3-5 |
-| 8+ | 5-10 |
-
-**Memory:** Each worker uses ~500MB-1GB during scanning
 
 ## Troubleshooting
 
@@ -176,18 +177,18 @@ curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/inst
 
 ```bash
 # Skip update if recently updated
-trivyscan -i image.tar -o ./reports -u
+trivyscan -i image.tar -o ./reports -sd
 ```
 
-### Out of Memory
+### Scan Timeout on Large Images
 
 ```bash
-# Reduce concurrency
-trivyscan -i *.tar -o ./reports -c 2
+trivyscan -i big-image.tar -o ./reports -t 30m
 ```
 
 ## Report Features
 
+- ✅ Summary page across all scanned images
 - ✅ Summary cards with vulnerability counts
 - ✅ Collapsible sections by component
 - ✅ Sortable tables (Severity → CVE → Package → Fix)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -43,14 +45,22 @@ const (
 	hashLength          = 6
 )
 
+// Output layout: <out>/json/<stem>.json, <out>/html/<stem>.html, <out>/summary.html
+const (
+	jsonSubdir  = "json"
+	htmlSubdir  = "html"
+	summaryFile = "summary.html"
+)
+
 const (
 	defaultMaxRetries        = 3
-	defaultMaxDepth          = 3
+	defaultMaxDepth          = 5
 	defaultInitialBackoff    = 2 * time.Second
 	defaultMaxBackoff        = 30 * time.Second
 	defaultBackoffMultiplier = 2.0
 	defaultJitterFactor      = 0.1
 	defaultScanTimeout       = 10 * time.Minute
+	scanTimeoutGrace         = 30 * time.Second
 )
 
 type options struct {
@@ -61,9 +71,11 @@ type options struct {
 	OnlyUpdate     bool
 	SkipDBUpdate   bool
 	SkipTrivyCheck bool
+	Force          bool
 	Version        bool
 	MaxRetries     int
 	MaxDepth       int
+	Timeout        time.Duration
 }
 
 // inputType describes what kind of input was provided
@@ -78,19 +90,25 @@ const (
 type scanTarget struct {
 	Input string
 	Kind  inputType
+	Stem  string // report file name without extension, see reportStem
 }
 
 type scanResult struct {
-	Target     scanTarget
-	OutputFile string
-	Error      error
-	Duration   time.Duration
-	Skipped    bool
+	Target   scanTarget
+	JSONFile string
+	HTMLFile string
+	Error    error
+	Duration time.Duration
+	Skipped  bool
+	Cached   bool // existing JSON reused, trivy not run
 }
 
 // ---------------------------------------------------------------------------
 // Error classification
 // ---------------------------------------------------------------------------
+
+// errScanTimeout marks a scan that hit the timeout. Retrying would only hit it again.
+var errScanTimeout = errors.New("scan timeout")
 
 // isInvalidImageError returns true when the tar is not a valid Docker/OCI image.
 // These errors should be skipped, not retried.
@@ -113,7 +131,7 @@ func isInvalidImageError(err error) bool {
 
 // isRetryableError returns true for transient infrastructure errors.
 func isRetryableError(err error) bool {
-	if err == nil || isInvalidImageError(err) {
+	if err == nil || isInvalidImageError(err) || errors.Is(err, errScanTimeout) {
 		return false
 	}
 	s := strings.ToLower(err.Error())
@@ -136,8 +154,8 @@ func isRetryableError(err error) bool {
 // Scan — sequential queue, one file at a time
 // ---------------------------------------------------------------------------
 
-// scanTarget scans a single target with retry, returns a scanResult.
-func scanOne(ctx context.Context, target scanTarget, outputDir, severity, scanner string, maxRetries int) scanResult {
+// scanOne scans a single target into jsonPath with retry, returns a scanResult.
+func scanOne(ctx context.Context, target scanTarget, jsonPath, scanner string, timeout time.Duration, maxRetries int) scanResult {
 	start := time.Now()
 
 	var lastErr error
@@ -148,9 +166,9 @@ func scanOne(ctx context.Context, target scanTarget, outputDir, severity, scanne
 		default:
 		}
 
-		outFile, err := processScan(ctx, target, outputDir, severity, scanner)
+		err := processScan(ctx, target, jsonPath, scanner, timeout)
 		if err == nil {
-			return scanResult{Target: target, OutputFile: outFile, Duration: time.Since(start)}
+			return scanResult{Target: target, JSONFile: jsonPath, Duration: time.Since(start)}
 		}
 
 		// Invalid tar — skip immediately, no retry (not applicable to image refs)
@@ -183,26 +201,35 @@ func scanOne(ctx context.Context, target scanTarget, outputDir, severity, scanne
 	return scanResult{Target: target, Error: lastErr, Duration: time.Since(start)}
 }
 
-// processScan runs trivy against a scanTarget and writes the HTML report.
-func processScan(ctx context.Context, target scanTarget, outputDir, severity, scanner string) (string, error) {
-	scanCtx, cancel := context.WithTimeout(ctx, defaultScanTimeout)
+// processScan runs trivy against a scanTarget and writes the full JSON report
+// (all severities; -s is applied at render time).
+func processScan(ctx context.Context, target scanTarget, jsonPath, scanner string, timeout time.Duration) error {
+	// trivy gets its own --timeout; ours adds a grace period so trivy can fail
+	// cleanly instead of being killed mid-write.
+	scanCtx, cancel := context.WithTimeout(ctx, timeout+scanTimeoutGrace)
 	defer cancel()
 
-	outFile := outputFilenameCustom(target.Input, outputDir)
 	log.Info().Str("input", target.Input).Str("kind", target.kindString()).Msg("Scanning")
 
+	// Write to .tmp and rename on success, so a failed or interrupted scan
+	// never leaves a truncated JSON behind.
+	tmpFile := jsonPath + ".tmp"
+	defer os.Remove(tmpFile)
+
 	args := []string{
-		trivyCmd, trivySubCmd,
-		"--format", "template",
-		"--template", templateContent,
-		"--output", outFile,
+		trivySubCmd,
+		"--quiet",
+		"--format", "json",
+		"--list-all-pkgs=false",
+		"--timeout", timeout.String(),
+		"--output", tmpFile,
 		trivySkipDB, trivySkipJavaDB,
 	}
 
 	switch target.Kind {
 	case inputTypeTar:
 		if _, err := os.Stat(target.Input); os.IsNotExist(err) {
-			return "", fmt.Errorf("file not found: %s", target.Input)
+			return fmt.Errorf("file not found: %s", target.Input)
 		}
 		args = append(args, "--input", target.Input)
 	case inputTypeImage:
@@ -210,21 +237,29 @@ func processScan(ctx context.Context, target scanTarget, outputDir, severity, sc
 		args = append(args, target.Input)
 	}
 
-	if severity != "" {
-		args = append(args, "--severity", severity)
-	}
 	if scanner != "" {
-		args = append(args, "--scanner", scanner)
+		args = append(args, "--scanners", scanner)
 	}
 
-	output, err := exec.CommandContext(scanCtx, args[0], args[1:]...).CombinedOutput()
+	output, err := exec.CommandContext(scanCtx, trivyCmd, args...).CombinedOutput()
 	if err != nil {
-		if scanCtx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("scan timeout: %w", err)
+		msg := trivyErrorMessage(output)
+		if scanCtx.Err() == context.DeadlineExceeded || strings.Contains(msg, "context deadline exceeded") {
+			return fmt.Errorf("%w after %s: %s", errScanTimeout, timeout, msg)
 		}
-		return "", fmt.Errorf("trivy failed: %w\n%s", err, output)
+		return fmt.Errorf("trivy failed: %w: %s", err, msg)
 	}
-	return outFile, nil
+	return os.Rename(tmpFile, jsonPath)
+}
+
+// trivyErrorMessage trims trivy output to the FATAL message, so error
+// classification does not match words from unrelated log lines.
+func trivyErrorMessage(output []byte) string {
+	s := strings.TrimSpace(string(output))
+	if i := strings.Index(s, "FATAL"); i >= 0 {
+		s = s[i:]
+	}
+	return s
 }
 
 func (t scanTarget) kindString() string {
@@ -287,11 +322,63 @@ func updateTrivyDB(ctx context.Context) error {
 	return nil
 }
 
+// trivyCacheDir mirrors trivy's default: $TRIVY_CACHE_DIR or <user cache dir>/trivy.
+func trivyCacheDir() string {
+	if dir := os.Getenv("TRIVY_CACHE_DIR"); dir != "" {
+		return dir
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "trivy")
+}
+
+// dbDownloadedAt returns when the local trivy databases last changed.
+// ok is false when the vulnerability DB metadata cannot be read.
+func dbDownloadedAt() (t time.Time, ok bool) {
+	cacheDir := trivyCacheDir()
+	if cacheDir == "" {
+		return time.Time{}, false
+	}
+	for _, db := range []struct {
+		dir      string
+		required bool
+	}{
+		{"db", true},
+		{"java-db", false},
+	} {
+		data, err := os.ReadFile(filepath.Join(cacheDir, db.dir, "metadata.json"))
+		if err != nil {
+			if db.required {
+				return time.Time{}, false
+			}
+			continue
+		}
+		var meta struct{ DownloadedAt time.Time }
+		if err := json.Unmarshal(data, &meta); err != nil {
+			if db.required {
+				return time.Time{}, false
+			}
+			continue
+		}
+		if meta.DownloadedAt.After(t) {
+			t = meta.DownloadedAt
+		}
+	}
+	return t, true
+}
+
+// isReportFresh reports whether jsonPath was written after the databases last changed.
+// The stem already contains the input's content hash, so the result cannot differ.
+func isReportFresh(jsonPath string, dbTime time.Time) bool {
+	info, err := os.Stat(jsonPath)
+	return err == nil && info.ModTime().After(dbTime)
+}
+
 // ---------------------------------------------------------------------------
 // Input resolution
 // ---------------------------------------------------------------------------
-
-const maxWalkDepth = 5
 
 // isTarFile returns true if the filename ends with .tar, .tar.gz, or .tgz.
 func isTarFile(name string) bool {
@@ -303,8 +390,8 @@ func isTarFile(name string) bool {
 //
 //   - image reference (nginx:latest, registry/img@sha256:...) → single inputTypeImage
 //   - existing .tar file                                       → single inputTypeTar
-//   - existing directory                                       → walk for .tar files
-func resolveTargets(input string) ([]scanTarget, error) {
+//   - existing directory                                       → walk for .tar files (sorted)
+func resolveTargets(input string, maxDepth int) ([]scanTarget, error) {
 	info, err := os.Stat(input)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -326,7 +413,7 @@ func resolveTargets(input string) ([]scanTarget, error) {
 		return []scanTarget{{Input: input, Kind: inputTypeTar}}, nil
 	}
 
-	// Directory — walk up to maxWalkDepth levels
+	// Directory — walk up to maxDepth levels
 	baseDepth := strings.Count(filepath.Clean(input), string(os.PathSeparator))
 
 	var (
@@ -342,7 +429,7 @@ func resolveTargets(input string) ([]scanTarget, error) {
 		}
 		depth := strings.Count(filepath.Clean(path), string(os.PathSeparator)) - baseDepth
 		if d.IsDir() {
-			if depth >= maxWalkDepth {
+			if depth >= maxDepth {
 				log.Debug().Str("dir", path).Msg("Max depth reached, skipping")
 				return filepath.SkipDir
 			}
@@ -358,8 +445,10 @@ func resolveTargets(input string) ([]scanTarget, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot walk directory: %w", err)
 	}
+	// fastwalk is concurrent; sort for a stable scan order across runs
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Input < targets[j].Input })
 
-	log.Info().Int("count", len(targets)).Str("directory", input).Int("max_depth", maxWalkDepth).Msg("Found .tar/.tar.gz/.tgz files")
+	log.Info().Int("count", len(targets)).Str("directory", input).Int("max_depth", maxDepth).Msg("Found .tar/.tar.gz/.tgz files")
 	return targets, nil
 }
 
@@ -411,7 +500,8 @@ func fileHash(filePath string) (string, error) {
 	return hash[:hashLength], nil
 }
 
-func outputFilenameCustom(input, outputDir string) string {
+// reportStem returns the report file name without extension: <base>_<hash6>.
+func reportStem(input string) string {
 	// For image references (e.g. nginx:latest), hash the string itself
 	// since there is no file to read.
 	var hash string
@@ -433,11 +523,11 @@ func outputFilenameCustom(input, outputDir string) string {
 		base = base[:len(base)-7] // strip .tar.gz (case-sensitive to preserve original)
 	} else if strings.HasSuffix(lowerBase, ".tgz") {
 		base = base[:len(base)-4] // strip .tgz (case-sensitive to preserve original)
-	} else {
-		base = strings.TrimSuffix(base, filepath.Ext(base))
+	} else if strings.HasSuffix(lowerBase, ".tar") {
+		base = base[:len(base)-4] // strip .tar (case-sensitive to preserve original)
 	}
 	base = strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(base)
-	return filepath.Join(outputDir, fmt.Sprintf("%s_%s-report.html", base, hash))
+	return fmt.Sprintf("%s_%s", base, hash)
 }
 
 func zerologPrettySetup() {
@@ -465,6 +555,43 @@ func main() {
 	os.Exit(run())
 }
 
+// publishReport renders the detail page for one JSON report and returns its summary row.
+func publishReport(outputDir, stem, jsonPath string, sev severitySet) (string, summaryRow, error) {
+	rep, err := loadReport(jsonPath)
+	if err != nil {
+		return "", summaryRow{}, err
+	}
+	htmlPath := filepath.Join(outputDir, htmlSubdir, stem+".html")
+	if err := writeFileAtomic(htmlPath, func(w io.Writer) error { return renderDetail(w, rep, sev) }); err != nil {
+		return "", summaryRow{}, fmt.Errorf("render %s: %w", htmlPath, err)
+	}
+	return htmlPath, summarize(stem, jsonPath, rep, sev), nil
+}
+
+// loadPreviousReports re-renders JSON reports from earlier runs that are not
+// part of this run, so the summary and detail pages reflect the current -s.
+func loadPreviousReports(outputDir string, targets []scanTarget, sev severitySet, rows map[string]summaryRow) {
+	current := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		current[t.Stem] = true
+	}
+	files, _ := filepath.Glob(filepath.Join(outputDir, jsonSubdir, "*.json"))
+	for _, jsonPath := range files {
+		stem := strings.TrimSuffix(filepath.Base(jsonPath), ".json")
+		if current[stem] {
+			continue
+		}
+		if _, row, err := publishReport(outputDir, stem, jsonPath, sev); err != nil {
+			log.Warn().Str("file", jsonPath).Err(err).Msg("Skipping unreadable report from previous run")
+		} else {
+			rows[stem] = row
+		}
+	}
+	if len(rows) > 0 {
+		log.Info().Int("count", len(rows)).Msg("Loaded reports from previous runs")
+	}
+}
+
 // run contains all application logic and returns an exit code.
 // Using a separate function keeps main clean and ensures defers always execute.
 func run() int {
@@ -476,16 +603,18 @@ func run() int {
 		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar/.tar.gz/.tgz file or directory (required)"),
 	)
 	flagSet.CreateGroup("output", "Output",
-		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory for HTML reports"),
+		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory (json/, html/, summary.html)"),
 	)
 	flagSet.CreateGroup("configs", "Configs",
-		flagSet.StringVarP(&opts.Severity, "severity", "s", "", "severity levels"),
-		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanner to use (vuln,misconfig,secret,license)"),
+		flagSet.StringVarP(&opts.Severity, "severity", "s", "", "severity levels to show in reports (default all)"),
+		flagSet.StringVarP(&opts.Scanner, "scanner", "S", "", "scanners to use (vuln,misconfig,secret,license)"),
 		flagSet.BoolVarP(&opts.OnlyUpdate, "update", "u", false, "only update database and exit"),
 		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "sd", false, "skip database update"),
 		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "st", false, "skip trivy installation check"),
+		flagSet.BoolVarP(&opts.Force, "force", "f", false, "rescan even if an up-to-date JSON report exists"),
 		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "rt", defaultMaxRetries, "max retry attempts"),
-		flagSet.IntVarP(&opts.MaxDepth, "max-depth", "md", defaultMaxDepth, "max depth"),
+		flagSet.IntVarP(&opts.MaxDepth, "max-depth", "md", defaultMaxDepth, "max directory depth"),
+		flagSet.DurationVarP(&opts.Timeout, "timeout", "t", defaultScanTimeout, "timeout per scan"),
 	)
 	flagSet.CreateGroup("info", "Info",
 		flagSet.BoolVarP(&opts.Version, "version", "v", false, "show version"),
@@ -515,6 +644,14 @@ func run() int {
 		log.Error().Msg("Input required: -i file.tar OR -i file.tar.gz OR -i file.tgz OR -i ./directory")
 		return 1
 	}
+	if opts.MaxDepth < 1 {
+		log.Error().Int("max_depth", opts.MaxDepth).Msg("--max-depth must be at least 1")
+		return 1
+	}
+	if opts.Timeout <= 0 {
+		log.Error().Dur("timeout", opts.Timeout).Msg("--timeout must be positive")
+		return 1
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
@@ -537,7 +674,7 @@ func run() int {
 		}
 	}
 
-	targets, err := resolveTargets(opts.Input)
+	targets, err := resolveTargets(opts.Input, opts.MaxDepth)
 	if err != nil {
 		log.Error().Err(err).Msg("Error resolving input")
 		return 1
@@ -547,9 +684,34 @@ func run() int {
 		return 1
 	}
 
-	if err := os.MkdirAll(opts.Output, 0755); err != nil {
+	jsonDir := filepath.Join(opts.Output, jsonSubdir)
+	if err := os.MkdirAll(jsonDir, 0755); err != nil {
 		log.Error().Err(err).Msg("Cannot create output directory")
 		return 1
+	}
+
+	// Hash each input once; the stem is reused for retries and all output files.
+	log.Info().Int("targets", len(targets)).Msg("Hashing inputs")
+	for i := range targets {
+		targets[i].Stem = reportStem(targets[i].Input)
+	}
+
+	sev := parseSeverity(opts.Severity)
+	rows := map[string]summaryRow{}
+	summaryPath := filepath.Join(opts.Output, summaryFile)
+	summaryFailed := false
+	writeSummary := func() {
+		if err := writeFileAtomic(summaryPath, func(w io.Writer) error { return renderSummary(w, rows, sev) }); err != nil {
+			log.Error().Err(err).Str("file", summaryPath).Msg("Summary write failed")
+			summaryFailed = true
+		}
+	}
+
+	loadPreviousReports(opts.Output, targets, sev, rows)
+
+	dbTime, haveDBTime := dbDownloadedAt()
+	if !haveDBTime && !opts.Force {
+		log.Debug().Msg("Trivy DB metadata unavailable, every target will be scanned")
 	}
 
 	log.Info().Str("version", version).Int("targets", len(targets)).Msg("Starting scan")
@@ -569,7 +731,27 @@ func run() int {
 
 		log.Info().Int("current", i+1).Int("total", len(targets)).Str("input", target.Input).Str("kind", target.kindString()).Msg("Progress")
 
-		result := scanOne(ctx, target, opts.Output, opts.Severity, opts.Scanner, opts.MaxRetries)
+		jsonPath := filepath.Join(jsonDir, target.Stem+".json")
+		var result scanResult
+		// Image references can change upstream under the same name, so only tars are reused.
+		if !opts.Force && haveDBTime && target.Kind == inputTypeTar && isReportFresh(jsonPath, dbTime) {
+			log.Info().Str("input", target.Input).Str("json", jsonPath).Msg("Report up to date, skipping scan (use --force to rescan)")
+			result = scanResult{Target: target, JSONFile: jsonPath, Cached: true}
+		} else {
+			result = scanOne(ctx, target, jsonPath, opts.Scanner, opts.Timeout, opts.MaxRetries)
+		}
+
+		if result.Error == nil {
+			htmlPath, row, err := publishReport(opts.Output, target.Stem, jsonPath, sev)
+			if err != nil {
+				result.Error = err
+			} else {
+				result.HTMLFile = htmlPath
+				rows[target.Stem] = row
+				writeSummary()
+			}
+		}
+
 		switch {
 		case result.Error == nil:
 			successResults = append(successResults, result)
@@ -581,11 +763,18 @@ func run() int {
 		}
 	}
 
+	// Always write the summary at the end, also when nothing succeeded this run.
+	writeSummary()
+
 	elapsed := time.Since(startTime)
 
+	cached := 0
 	log.Info().Msg("── SCAN SUMMARY ──────────────────────────────")
 	for _, r := range successResults {
-		log.Info().Str("input", r.Target.Input).Str("output", r.OutputFile).Dur("duration", r.Duration).Msg("OK")
+		if r.Cached {
+			cached++
+		}
+		log.Info().Str("input", r.Target.Input).Str("html", r.HTMLFile).Bool("cached", r.Cached).Dur("duration", r.Duration).Msg("OK")
 	}
 	for _, r := range skippedResults {
 		log.Warn().Str("input", r.Target.Input).Msg("SKIPPED (invalid Docker/OCI tar)")
@@ -596,12 +785,14 @@ func run() int {
 	log.Info().
 		Dur("duration", elapsed).
 		Int("success", len(successResults)).
+		Int("cached", cached).
 		Int("skipped", len(skippedResults)).
 		Int("failed", len(failResults)).
 		Int("total", len(targets)).
+		Str("summary", summaryPath).
 		Msg("Complete")
 
-	if len(failResults) > 0 {
+	if len(failResults) > 0 || summaryFailed {
 		return 1
 	}
 	return 0

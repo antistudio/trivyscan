@@ -111,14 +111,14 @@ trivyscan --version
 # Scan a single image
 trivyscan -i image.tar -o reports/
 
-# Scan a directory of tar files
+# Scan a directory of tar files → reports/json/, reports/html/, reports/summary.html
 trivyscan -i ./images/ -o reports/
 
-# Custom severity
+# Custom severity (render-time filter, no rescan needed)
 trivyscan -i image.tar -o reports/ -s CRITICAL,HIGH
 
-# Set concurrency
-trivyscan -i ./images/ -o reports/ -c 5
+# Force a rescan of unchanged images
+trivyscan -i ./images/ -o reports/ --force
 ```
 
 ---
