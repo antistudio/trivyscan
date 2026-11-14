@@ -228,4 +228,87 @@ func TestErrorClassification(t *testing.T) {
 	if isRetryableError(errors.New("unable to initialize archive image: connection")) {
 		t.Error("invalid image must not be retried")
 	}
+	// Real trivy output for a missing tag / missing repository.
+	for _, msg := range []string{
+		`remote error: GET https://index.docker.io/v2/library/alpine/manifests/no-such-tag: MANIFEST_UNKNOWN: manifest unknown`,
+		`remote error: GET https://index.docker.io/v2/library/nope/manifests/latest: UNAUTHORIZED: authentication required`,
+	} {
+		if isRetryableError(errors.New("trivy failed: exit status 1: " + msg + " connection i/o timeout")) {
+			t.Errorf("registry rejection must not be retried: %s", msg)
+		}
+	}
+}
+
+func TestIsImageReference(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"nginx", true},
+		{"nginx:latest", true},
+		{"images3:dev", true},
+		{"myrepo/myimage", true},
+		{"ghcr.io/org/team/app:1.2.3-rc.1", true},
+		{"registry.local:5000/app:dev", true},
+		{"localhost/app", true},
+		{"repo/img@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true},
+		{"repo/img:1.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true},
+		{"missing.tar", false},
+		{"images/app.tar.gz", false},
+		{"./images", false},
+		{"/abs/path", false},
+		{"images/", false},
+		{"MyImage:latest", false},
+		{`C:\images`, false},
+		{"nginx:", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isImageReference(tt.in); got != tt.want {
+			t.Errorf("isImageReference(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestResolveInputs(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"b.tar", "a.tgz", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	single := filepath.Join(dir, "b.tar")
+
+	targets, err := resolveInputs([]string{"nginx:latest", dir, "app:dev", "nginx:latest", single}, defaultMaxDepth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, tg := range targets {
+		got = append(got, fmt.Sprintf("%s:%s", tg.kindString(), filepath.Base(tg.Input)))
+	}
+	// order kept, directory sorted, duplicates (nginx:latest, b.tar) dropped
+	want := "image:nginx:latest tar:a.tgz tar:b.tar image:app:dev"
+	if strings.Join(got, " ") != want {
+		t.Errorf("targets = %v, want %s", got, want)
+	}
+
+	if _, err := resolveInputs([]string{"nginx:latest", "./missing-dir"}, defaultMaxDepth); err == nil {
+		t.Error("non-existent path that is not an image reference should fail")
+	}
+}
+
+func TestReadTargetList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "images.txt")
+	content := "# production\nnginx:latest\n\n  app:dev  # team A\r\nimages/old.tar\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readTargetList(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "nginx:latest|app:dev|images/old.tar"; strings.Join(got, "|") != want {
+		t.Errorf("readTargetList = %q, want %s", got, want)
+	}
 }

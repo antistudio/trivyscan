@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -64,7 +65,8 @@ const (
 )
 
 type options struct {
-	Input          string
+	Inputs         goflags.StringSlice
+	ListFile       string
 	Output         string
 	Severity       string
 	Scanner        string
@@ -129,9 +131,28 @@ func isInvalidImageError(err error) bool {
 	return false
 }
 
+// isImageNotFoundError returns true when the registry definitively rejected an
+// image reference (unknown name/tag, or no access). Retrying cannot help.
+func isImageNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, p := range []string{
+		"MANIFEST_UNKNOWN",
+		"NAME_UNKNOWN",
+		"UNAUTHORIZED",
+		"DENIED",
+	} {
+		if strings.Contains(err.Error(), p) {
+			return true
+		}
+	}
+	return false
+}
+
 // isRetryableError returns true for transient infrastructure errors.
 func isRetryableError(err error) bool {
-	if err == nil || isInvalidImageError(err) || errors.Is(err, errScanTimeout) {
+	if err == nil || isInvalidImageError(err) || isImageNotFoundError(err) || errors.Is(err, errScanTimeout) {
 		return false
 	}
 	s := strings.ToLower(err.Error())
@@ -386,6 +407,48 @@ func isTarFile(name string) bool {
 	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") || strings.HasSuffix(lower, ".tar")
 }
 
+// resolveInputs resolves every -i item (and -l line) into scanTargets,
+// keeping the given order and dropping duplicates.
+func resolveInputs(inputs []string, maxDepth int) ([]scanTarget, error) {
+	var (
+		targets []scanTarget
+		seen    = map[string]bool{}
+	)
+	for _, input := range inputs {
+		resolved, err := resolveTargets(input, maxDepth)
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range resolved {
+			if seen[t.Input] {
+				log.Debug().Str("input", t.Input).Msg("Duplicate target, skipping")
+				continue
+			}
+			seen[t.Input] = true
+			targets = append(targets, t)
+		}
+	}
+	return targets, nil
+}
+
+// readTargetList reads one input per line from path; blank lines and # comments are ignored.
+func readTargetList(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read target list: %w", err)
+	}
+	var inputs []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = line[:i]
+		}
+		if line = strings.TrimSpace(line); line != "" {
+			inputs = append(inputs, line)
+		}
+	}
+	return inputs, nil
+}
+
 // resolveTargets classifies the input and returns a list of scanTargets.
 //
 //   - image reference (nginx:latest, registry/img@sha256:...) → single inputTypeImage
@@ -452,22 +515,21 @@ func resolveTargets(input string, maxDepth int) ([]scanTarget, error) {
 	return targets, nil
 }
 
-// isImageReference returns true if s looks like a container image reference:
-// optional registry host, image name, and optional tag or digest.
-// Examples: nginx, nginx:1.25, registry.io/myapp:latest, repo/img@sha256:abc
+// imageRefRe follows the Docker reference grammar (distribution/reference):
+// [registry[:port]/]path-component[/path-component...][:tag][@digest]
+// Path components are lowercase, so paths like ./Images or C:\x never match.
+var imageRefRe = regexp.MustCompile(`^` +
+	`(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*(?::[0-9]+)?/)?` + // registry
+	`[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*` + // repository path
+	`(?::[\w][\w.-]{0,127})?` + // tag
+	`(?:@[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,})?` + // digest
+	`$`)
+
+// isImageReference returns true if s is a valid container image reference.
+// Examples: nginx, nginx:1.25, myrepo/app, registry.io:5000/team/app:dev, repo/img@sha256:abc...
 func isImageReference(s string) bool {
-	// Must not be an existing path — caller already checked os.Stat
-	// Simple heuristic: contains ":" (tag) or "@" (digest), or is a bare name
-	// with no path separator characters that would indicate a filesystem path.
-	if strings.Contains(s, "@") {
-		return true // digest reference
-	}
-	if strings.Contains(s, ":") {
-		// Could be "image:tag" or "/path/to/file" — reject if it looks like a tar file
-		return !isTarFile(s)
-	}
-	// Bare name like "nginx" or "myrepo/myimage" — valid if no OS path separators
-	return !strings.ContainsAny(s, `\/`)
+	// app.tar is a valid reference by grammar, but a missing tar is far more likely
+	return len(s) <= 255 && !isTarFile(s) && imageRefRe.MatchString(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +662,8 @@ func run() int {
 	flagSet := goflags.NewFlagSet()
 	flagSet.SetDescription("TrivyScan - Scan container images using Trivy")
 	flagSet.CreateGroup("input", "Input",
-		flagSet.StringVarP(&opts.Input, "input", "i", "", "input .tar/.tar.gz/.tgz file or directory (required)"),
+		flagSet.StringSliceVarP(&opts.Inputs, "input", "i", nil, "images (nginx:latest), .tar/.tar.gz/.tgz files or directories, comma-separated or repeated", goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringVarP(&opts.ListFile, "list", "l", "", "file with one input per line (# comments allowed)"),
 	)
 	flagSet.CreateGroup("output", "Output",
 		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory (json/, html/, summary.html)"),
@@ -640,8 +703,22 @@ func run() int {
 		return 0
 	}
 
-	if opts.Input == "" {
-		log.Error().Msg("Input required: -i file.tar OR -i file.tar.gz OR -i file.tgz OR -i ./directory")
+	var inputs []string
+	for _, in := range opts.Inputs {
+		if in = strings.TrimSpace(in); in != "" {
+			inputs = append(inputs, in)
+		}
+	}
+	if opts.ListFile != "" {
+		listed, err := readTargetList(opts.ListFile)
+		if err != nil {
+			log.Error().Err(err).Msg("Error reading -l")
+			return 1
+		}
+		inputs = append(inputs, listed...)
+	}
+	if len(inputs) == 0 {
+		log.Error().Msg("Input required: -i nginx:latest,app:dev OR -i image.tar OR -i ./directory OR -l images.txt")
 		return 1
 	}
 	if opts.MaxDepth < 1 {
@@ -674,13 +751,13 @@ func run() int {
 		}
 	}
 
-	targets, err := resolveTargets(opts.Input, opts.MaxDepth)
+	targets, err := resolveInputs(inputs, opts.MaxDepth)
 	if err != nil {
 		log.Error().Err(err).Msg("Error resolving input")
 		return 1
 	}
 	if len(targets) == 0 {
-		log.Error().Msgf("No scannable targets found in: %s", opts.Input)
+		log.Error().Strs("inputs", inputs).Msg("No scannable targets found")
 		return 1
 	}
 

@@ -53,8 +53,11 @@ For manual installation and more details, see [INSTALL.md](INSTALL.md).
 # Scan single image
 trivyscan -i nginx.tar -o ./reports
 
-# Scan image reference
-trivyscan -i nginx:1.25 -o ./reports
+# Scan image references (local Docker/containerd/Podman, or pulled from the registry)
+trivyscan -i nginx:latest,redis:7,ghcr.io/org/app:dev -o ./reports
+
+# Scan images listed in a file (one per line, # comments allowed)
+trivyscan -l images.txt -o ./reports
 
 # Scan folder (all .tar/.tar.gz/.tgz files) → per-image reports + summary.html
 trivyscan -i ./images -o ./reports
@@ -73,7 +76,8 @@ trivyscan [flags]
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `--input` | `-i` | Input `.tar`/`.tar.gz`/`.tgz` file, directory, or image reference | *required* |
+| `--input` | `-i` | Image references, `.tar`/`.tar.gz`/`.tgz` files or directories; comma-separated or repeated | *required* (or `-l`) |
+| `--list` | `-l` | File with one input per line (`#` comments allowed) | |
 | `--output` | `-o` | Output directory (`json/`, `html/`, `summary.html`) | `.` |
 | `--severity` | `-s` | Severity levels shown in reports (render-time filter) | all |
 | `--scanner` | `-S` | Trivy scanners (`vuln,misconfig,secret,license`) | Trivy default |
@@ -105,6 +109,28 @@ trivyscan -i production.tar -o ./reports -s CRITICAL,HIGH
 ```bash
 trivyscan -i ./images -o ./reports
 ```
+
+### Scan Image References
+
+```bash
+# Comma-separated, repeated -i, and a list file can be combined; duplicates are scanned once
+trivyscan -i nginx:latest,app:dev -i registry.local:5000/team/api:1.4 -l images.txt -o ./reports
+```
+
+```
+# images.txt
+nginx:latest
+redis:7-alpine          # cache
+ghcr.io/org/app@sha256:<digest>
+./exports/legacy.tar    # tar files and directories work here too
+```
+
+- Anything that is not an existing path and matches the Docker reference grammar
+  (`[registry[:port]/]name[:tag][@digest]`, lowercase name) is treated as an image.
+- Trivy looks for the image in Docker, containerd, Podman, then the remote registry.
+  Private registries use your `docker login` credentials, or `TRIVY_USERNAME`/`TRIVY_PASSWORD`.
+- Image references are always rescanned (a tag can move); only `.tar` inputs reuse an up-to-date JSON.
+- An unknown tag/repository or a denied pull fails immediately instead of being retried.
 
 ### CI/CD (Skip DB Update)
 
