@@ -3,7 +3,7 @@
 # Trivy + TrivyScan installer for Linux / macOS
 #
 # Usage (remote):
-#   curl -fsSL https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | sudo bash
 #
 # Usage (local, from an extracted release archive):
 #   ./install.sh
@@ -16,7 +16,7 @@
 # =========================================
 TRIVY_INSTALL_DIR="/usr/local/bin"
 TRIVYSCAN_INSTALL_DIR="/usr/local/bin"
-TRIVYSCAN_REPO="anhnmt/trivyscan"
+TRIVYSCAN_REPO="antistudio/trivyscan"
 
 # SCRIPT_DIR is only meaningful when run from a file; under `curl | bash`
 # BASH_SOURCE is empty and the binary is downloaded instead.

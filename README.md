@@ -34,7 +34,7 @@ go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o tri
 Open PowerShell as **Administrator** and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.ps1 | iex
 ```
 
 This downloads the latest release, installs Trivy + TrivyScan to `C:\Program Files\`, and adds both to `PATH`.
@@ -42,7 +42,7 @@ This downloads the latest release, installs Trivy + TrivyScan to `C:\Program Fil
 #### Linux / macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | sudo bash
 ```
 
 For manual installation and more details, see [INSTALL.md](INSTALL.md).
@@ -187,7 +187,7 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
 ```yaml
 - name: Security Scan
   run: |
-    go install github.com/anhnmt/trivyscan@latest
+    go install github.com/antistudio/trivyscan@latest
     trivyscan -i myapp.tar -o ./reports --fail-on HIGH
 
 - name: Upload Reports
@@ -203,7 +203,7 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
 ```yaml
 security-scan:
   script:
-    - go install github.com/anhnmt/trivyscan@latest
+    - go install github.com/antistudio/trivyscan@latest
     - trivyscan -i image.tar -o ./reports --fail-on HIGH
   artifacts:
     when: always
@@ -250,4 +250,4 @@ MIT License
 
 ## Author
 
-[anhnmt](https://github.com/anhnmt)
+[antistudio](https://github.com/antistudio)

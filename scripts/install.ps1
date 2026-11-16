@@ -2,7 +2,7 @@
 # TrivyScan Installer
 #
 # Usage (remote):
-#   irm https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.ps1 | iex
 #
 # Usage (local, from extracted zip):
 #   powershell -ExecutionPolicy Bypass -File install.ps1
@@ -47,7 +47,7 @@ if (-not $isAdmin -or $policy -ne 'Bypass') {
 # =========================================
 # Config
 # =========================================
-$RepoOwner    = "anhnmt"
+$RepoOwner    = "antistudio"
 $RepoName     = "trivyscan"
 $ApiUrl       = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
 $TrivyDir     = "C:\Program Files\Trivy"

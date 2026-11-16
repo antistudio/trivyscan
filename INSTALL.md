@@ -48,7 +48,7 @@ Set `TRIVYSCAN_SKIP_CHECKSUM=1` to skip verification on purpose (not recommended
 ### Linux / macOS (remote — one-liner)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | sudo bash
 ```
 
 Downloads the latest release for your OS/CPU and installs Trivy + TrivyScan to `/usr/local/bin`.
@@ -70,7 +70,7 @@ When `trivyscan` is next to `install.sh`, that binary is installed instead of do
 Open PowerShell as **Administrator** and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.ps1 | iex
 ```
 
 This downloads the latest release and installs everything automatically.
