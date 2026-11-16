@@ -1,11 +1,29 @@
 #!/bin/bash
+#
+# Trivy + TrivyScan installer for Linux / macOS
+#
+# Usage (remote):
+#   curl -fsSL https://raw.githubusercontent.com/anhnmt/trivyscan/main/scripts/install.sh | sudo bash
+#
+# Usage (local, from an extracted release archive):
+#   ./install.sh
+#
+# Every download is verified against the release's SHA-256 checksums file.
+# Set TRIVYSCAN_SKIP_CHECKSUM=1 to install without verification (not recommended).
 
 # =========================================
 # Config
 # =========================================
 TRIVY_INSTALL_DIR="/usr/local/bin"
 TRIVYSCAN_INSTALL_DIR="/usr/local/bin"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TRIVYSCAN_REPO="anhnmt/trivyscan"
+
+# SCRIPT_DIR is only meaningful when run from a file; under `curl | bash`
+# BASH_SOURCE is empty and the binary is downloaded instead.
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
 # =========================================
 # Args
@@ -16,7 +34,7 @@ for arg in "$@"; do
     case "$arg" in
         --force|-f) FORCE=true ;;
         --uninstall|-u) UNINSTALL=true ;;
-        --help|-h) 
+        --help|-h)
             echo "Usage: ./install.sh [OPTIONS]"
             echo "  --force, -f     Force reinstall"
             echo "  --uninstall, -u Uninstall both"
@@ -27,12 +45,85 @@ for arg in "$@"; do
 done
 
 # =========================================
-# Helper
+# Helpers
 # =========================================
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then "$@"
     else sudo "$@"
     fi
+}
+
+# Private temp dir: a fixed /tmp path could be pre-created by another user
+# and its contents would then be installed as root.
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trivyscan-install.XXXXXX")" || {
+    echo "[ERROR] Cannot create temp directory"
+    exit 1
+}
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# fetch URL OUTPUT — download following redirects, fail on HTTP errors.
+fetch() {
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget &>/dev/null; then
+        wget -q "$1" -O "$2"
+    else
+        echo "[ERROR] curl or wget is required"
+        return 1
+    fi
+}
+
+# latest_tag REPO — print the latest release tag without the leading "v".
+# github.com/<repo>/releases/latest redirects to .../releases/tag/<tag>; unlike
+# the REST API it has no 60 requests/hour limit, so curl uses it first.
+latest_tag() {
+    local tag=""
+    if command -v curl &>/dev/null; then
+        tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$1/releases/latest" 2>/dev/null)"
+        tag="${tag##*/releases/tag/}"
+    fi
+    if ! echo "$tag" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+'; then
+        local json="$TMP_DIR/release.json"
+        fetch "https://api.github.com/repos/$1/releases/latest" "$json" 2>/dev/null || return 1
+        tag="$(grep '"tag_name"' "$json" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    fi
+    echo "${tag#v}"
+}
+
+sha256_of() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+# verify FILE CHECKSUMS_FILE NAME — compare FILE against the line for NAME.
+verify() {
+    local file="$1" sums="$2" name="$3" expected actual
+    if [ "${TRIVYSCAN_SKIP_CHECKSUM:-}" = "1" ]; then
+        echo "[WARN] TRIVYSCAN_SKIP_CHECKSUM=1: NOT verifying $name"
+        return 0
+    fi
+    expected="$(awk -v n="$name" '$2 == n || $2 == "*"n {print $1; exit}' "$sums")"
+    if [ -z "$expected" ]; then
+        echo "[ERROR] No checksum for $name in checksums file"
+        return 1
+    fi
+    if ! actual="$(sha256_of "$file")"; then
+        echo "[ERROR] sha256sum or shasum is required to verify downloads"
+        echo "        (set TRIVYSCAN_SKIP_CHECKSUM=1 to install without verification)"
+        return 1
+    fi
+    if [ "$expected" != "$actual" ]; then
+        echo "[ERROR] Checksum mismatch for $name"
+        echo "        expected $expected"
+        echo "        got      $actual"
+        return 1
+    fi
+    echo "[OK] Checksum verified: $name"
 }
 
 # =========================================
@@ -42,7 +133,6 @@ if [ "$UNINSTALL" = true ]; then
     echo ""
     echo "[INFO] Uninstalling..."
 
-    # Remove binaries
     if [ -f "$TRIVY_INSTALL_DIR/trivy" ]; then
         run_privileged rm -f "$TRIVY_INSTALL_DIR/trivy"
         echo "[OK] Removed $TRIVY_INSTALL_DIR/trivy"
@@ -89,6 +179,7 @@ echo "[INFO] OS: $OS | Arch: $ARCH_GO"
 
 trivy_updated=false
 trivyscan_updated=false
+trivyscan_failed=false
 
 # =========================================
 # Step 1: Install/Update Trivy
@@ -101,15 +192,7 @@ if command -v trivy &>/dev/null; then
     current_trivy=$(trivy --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 fi
 
-# Get latest version from GitHub
-latest_trivy=""
-if command -v curl &>/dev/null; then
-    latest_trivy=$(curl -s "https://api.github.com/repos/aquasecurity/trivy/releases/latest" \
-        | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
-elif command -v wget &>/dev/null; then
-    latest_trivy=$(wget -qO- "https://api.github.com/repos/aquasecurity/trivy/releases/latest" \
-        | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
-fi
+latest_trivy="$(latest_tag aquasecurity/trivy)"
 
 if [ -z "$latest_trivy" ]; then
     echo "[WARN] Cannot fetch Trivy version - skipping"
@@ -122,31 +205,25 @@ else
         echo "[INFO] Trivy not found, installing v$latest_trivy..."
     fi
 
-    url="https://github.com/aquasecurity/trivy/releases/download/v${latest_trivy}/trivy_${latest_trivy}_${OS_TRIVY}-${ARCH_TRIVY}.tar.gz"
-    tmp_archive="/tmp/trivy.tar.gz"
-    tmp_dir="/tmp/trivy_extract"
+    base="https://github.com/aquasecurity/trivy/releases/download/v${latest_trivy}"
+    asset="trivy_${latest_trivy}_${OS_TRIVY}-${ARCH_TRIVY}.tar.gz"
+    sums="trivy_${latest_trivy}_checksums.txt"
+    extract_dir="$TMP_DIR/trivy"
 
-    echo "[INFO] Downloading from: $url"
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$tmp_archive"
-    else
-        wget -q "$url" -O "$tmp_archive"
-    fi
-
-    if [ ! -f "$tmp_archive" ]; then
+    echo "[INFO] Downloading from: $base/$asset"
+    if ! fetch "$base/$asset" "$TMP_DIR/$asset" || ! fetch "$base/$sums" "$TMP_DIR/$sums"; then
         echo "[ERROR] Download failed"
+    elif ! verify "$TMP_DIR/$asset" "$TMP_DIR/$sums" "$asset"; then
+        echo "[ERROR] Trivy not installed"
     else
         echo "[INFO] Extracting..."
-        rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
-        tar -xzf "$tmp_archive" -C "$tmp_dir"
-        rm -f "$tmp_archive"
+        mkdir -p "$extract_dir"
+        tar -xzf "$TMP_DIR/$asset" -C "$extract_dir"
 
-        if [ ! -f "$tmp_dir/trivy" ]; then
+        if [ ! -f "$extract_dir/trivy" ]; then
             echo "[ERROR] trivy binary not found after extraction"
         else
-            run_privileged cp "$tmp_dir/trivy" "$TRIVY_INSTALL_DIR/trivy"
-            run_privileged chmod 755 "$TRIVY_INSTALL_DIR/trivy"
-            rm -rf "$tmp_dir"
+            run_privileged install -m 755 "$extract_dir/trivy" "$TRIVY_INSTALL_DIR/trivy"
             echo "[OK] Trivy installed/updated to v$latest_trivy"
             trivy_updated=true
         fi
@@ -159,34 +236,69 @@ fi
 echo ""
 echo "[INFO] Checking TrivyScan..."
 
-source_bin="$SCRIPT_DIR/trivyscan_${OS_GO}"
-
 current_trivyscan=""
-if [ -f "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
-    current_trivyscan=$($TRIVYSCAN_INSTALL_DIR/trivyscan --version 2>/dev/null | head -1)
+if [ -x "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
+    current_trivyscan=$("$TRIVYSCAN_INSTALL_DIR/trivyscan" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 fi
 
-if [ ! -f "$source_bin" ]; then
-    echo "[ERROR] Binary not found: trivyscan_${OS_GO}"
-    echo "        Available files in current directory:"
-    ls "$SCRIPT_DIR"/trivyscan_* 2>/dev/null || echo "        (none found)"
-elif ! $FORCE && [ -n "$current_trivyscan" ]; then
-    echo "[OK] TrivyScan already installed"
-else
-    if [ -n "$current_trivyscan" ]; then
-        echo "[INFO] Reinstalling TrivyScan..."
-    else
-        echo "[INFO] TrivyScan not found, installing..."
+# Local mode: binary next to this script (extracted archive; older archives used trivyscan_<os>).
+source_bin=""
+if [ -n "$SCRIPT_DIR" ]; then
+    for name in trivyscan "trivyscan_${OS_GO}"; do
+        if [ -f "$SCRIPT_DIR/$name" ]; then
+            source_bin="$SCRIPT_DIR/$name"
+            break
+        fi
+    done
+fi
+
+if [ -n "$source_bin" ]; then
+    echo "[INFO] Using local binary: $source_bin"
+    if ! $FORCE && [ -n "$current_trivyscan" ]; then
+        echo "[OK] TrivyScan already installed (use --force to reinstall)"
+        source_bin=""
     fi
-
-    run_privileged cp "$source_bin" "$TRIVYSCAN_INSTALL_DIR/trivyscan"
-    run_privileged chmod 755 "$TRIVYSCAN_INSTALL_DIR/trivyscan"
-
-    if [ ! -f "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
-        echo "[ERROR] Failed to install TrivyScan"
+else
+    # Remote mode: download the release archive for this OS/arch.
+    latest_trivyscan="$(latest_tag "$TRIVYSCAN_REPO")"
+    if [ -z "$latest_trivyscan" ]; then
+        echo "[ERROR] Cannot fetch TrivyScan release info"
+        trivyscan_failed=true
+    elif ! $FORCE && [ "$current_trivyscan" = "$latest_trivyscan" ]; then
+        echo "[OK] TrivyScan already up to date (v$current_trivyscan)"
     else
+        base="https://github.com/${TRIVYSCAN_REPO}/releases/download/v${latest_trivyscan}"
+        asset="trivyscan_${latest_trivyscan}_${OS_GO}_${ARCH_GO}.tar.gz"
+        sums="trivyscan_${latest_trivyscan}_checksums.txt"
+        extract_dir="$TMP_DIR/trivyscan"
+
+        echo "[INFO] Downloading from: $base/$asset"
+        if ! fetch "$base/$asset" "$TMP_DIR/$asset" || ! fetch "$base/$sums" "$TMP_DIR/$sums"; then
+            echo "[ERROR] Download failed"
+            trivyscan_failed=true
+        elif ! verify "$TMP_DIR/$asset" "$TMP_DIR/$sums" "$asset"; then
+            trivyscan_failed=true
+        else
+            mkdir -p "$extract_dir"
+            tar -xzf "$TMP_DIR/$asset" -C "$extract_dir"
+            if [ -f "$extract_dir/trivyscan" ]; then
+                source_bin="$extract_dir/trivyscan"
+            else
+                echo "[ERROR] trivyscan binary not found in $asset"
+                trivyscan_failed=true
+            fi
+        fi
+    fi
+fi
+
+if [ -n "$source_bin" ]; then
+    run_privileged install -m 755 "$source_bin" "$TRIVYSCAN_INSTALL_DIR/trivyscan"
+    if [ -x "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
         echo "[OK] TrivyScan installed"
         trivyscan_updated=true
+    else
+        echo "[ERROR] Failed to install TrivyScan"
+        trivyscan_failed=true
     fi
 fi
 
@@ -197,7 +309,7 @@ echo ""
 echo "[INFO] Checking PATH..."
 
 for dir in "$TRIVY_INSTALL_DIR" "$TRIVYSCAN_INSTALL_DIR"; do
-    if echo "$PATH" | grep -q "$dir"; then
+    if echo ":$PATH:" | grep -q ":$dir:"; then
         echo "[OK] $dir already in PATH"
     else
         echo "[WARN] $dir is not in PATH"
@@ -231,20 +343,24 @@ if [ -z "$latest_trivy" ]; then
     echo "[--] Trivy     -> skipped (cannot fetch version)"
 elif $trivy_updated; then
     echo "[OK] Trivy     -> installed/updated to v$latest_trivy"
-else
+elif [ -n "$current_trivy" ]; then
     echo "[OK] Trivy     -> already up to date (v$current_trivy)"
+else
+    echo "[--] Trivy     -> install failed"
 fi
 
-if [ ! -f "$source_bin" ]; then
-    echo "[--] TrivyScan -> skipped (binary not found)"
+if $trivyscan_failed; then
+    echo "[--] TrivyScan -> install failed"
 elif $trivyscan_updated; then
     echo "[OK] TrivyScan -> installed/updated"
-elif [ -n "$current_trivyscan" ]; then
-    echo "[OK] TrivyScan -> already installed"
 else
-    echo "[--] TrivyScan -> install failed"
+    echo "[OK] TrivyScan -> already installed"
 fi
 
 echo "========================================="
 echo " Install complete! Run: source ~/.bashrc (or ~/.zshrc)"
 echo "========================================="
+
+if $trivyscan_failed; then
+    exit 1
+fi

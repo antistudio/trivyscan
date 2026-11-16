@@ -94,17 +94,33 @@ func loadReport(path string) (*trivyReport, error) {
 // severitySet is the set of severities to display; nil means all.
 type severitySet map[string]bool
 
-func parseSeverity(s string) severitySet {
+// parseSeverity parses a comma-separated -s value. Unknown names are an error:
+// silently filtering on a typo like CRTICAL would report every image as clean.
+func parseSeverity(s string) (severitySet, error) {
 	set := severitySet{}
 	for _, p := range strings.Split(s, ",") {
-		if p = strings.ToUpper(strings.TrimSpace(p)); p != "" {
-			set[p] = true
+		p = strings.ToUpper(strings.TrimSpace(p))
+		if p == "" {
+			continue
 		}
+		if !isSeverity(p) {
+			return nil, fmt.Errorf("unknown severity %q (valid: %s)", p, strings.Join(summarySeverities, ", "))
+		}
+		set[p] = true
 	}
 	if len(set) == 0 {
-		return nil
+		return nil, nil
 	}
-	return set
+	return set, nil
+}
+
+func isSeverity(s string) bool {
+	for _, v := range summarySeverities {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 func (s severitySet) has(sev string) bool {
@@ -113,6 +129,11 @@ func (s severitySet) has(sev string) bool {
 
 // severityRank orders severities like trivy: CRITICAL first, unknown values last.
 var severityRank = map[string]int{"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+// atLeast reports whether severity sev is at or above level (both upper case).
+func atLeast(sev, level string) bool {
+	return severityRank[sev] >= severityRank[level]
+}
 
 // filterResults mirrors what trivy does before rendering a report:
 // drop findings outside the severity set and misconfigurations that did not
@@ -187,6 +208,14 @@ func renderDetail(w io.Writer, rep *trivyReport, sev severitySet) error {
 
 var summarySeverities = []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"}
 
+// Summary row status.
+const (
+	statusOK       = "ok"
+	statusFailed   = "failed"
+	statusSkipped  = "skipped"
+	statusPrevious = "previous" // report from an earlier run, not part of this one
+)
+
 type summaryRow struct {
 	Stem    string
 	Label   string
@@ -196,7 +225,25 @@ type summaryRow struct {
 	Href    string
 	Counts  map[string]int
 	Total   int
-	Highest string
+	Highest string // highest severity shown (after -s)
+	Worst   string // highest severity in the report, ignoring -s (for --fail-on)
+	Status  string
+	Error   string // short reason for failed/skipped rows
+}
+
+// maxRowError caps the error shown in a failed row; the full error is in the log.
+const maxRowError = 200
+
+// errorRow is the summary row for a target that produced no report this run.
+func errorRow(t scanTarget, status string, err error) summaryRow {
+	msg := ""
+	if err != nil {
+		msg = strings.Join(strings.Fields(err.Error()), " ")
+		if r := []rune(msg); len(r) > maxRowError {
+			msg = string(r[:maxRowError]) + "…"
+		}
+	}
+	return summaryRow{Stem: t.Stem, Label: t.Input, OS: "-", Status: status, Error: msg, Counts: map[string]int{}}
 }
 
 func summarize(stem, jsonPath string, rep *trivyReport, sev severitySet) summaryRow {
@@ -206,6 +253,7 @@ func summarize(stem, jsonPath string, rep *trivyReport, sev severitySet) summary
 		OS:     "-",
 		Href:   htmlSubdir + "/" + stem + ".html",
 		Counts: map[string]int{},
+		Status: statusOK,
 	}
 	if len(rep.Metadata.RepoTags) > 0 {
 		row.Label = rep.Metadata.RepoTags[0]
@@ -236,6 +284,13 @@ func summarize(stem, jsonPath string, rep *trivyReport, sev severitySet) summary
 			break
 		}
 	}
+	for _, r := range filterResults(rep.Results, nil) {
+		for _, v := range r.Vulnerabilities {
+			if s := strings.ToUpper(v.Severity); row.Worst == "" || severityRank[s] > severityRank[row.Worst] {
+				row.Worst = s
+			}
+		}
+	}
 	return row
 }
 
@@ -246,7 +301,11 @@ type summaryData struct {
 	Rows       []summaryRow
 	Totals     map[string]int
 	Total      int
+	Failed     int // failed + skipped rows
 }
+
+// statusRank sorts failures first and earlier runs last.
+var statusRank = map[string]int{statusFailed: 0, statusSkipped: 1, statusOK: 2, statusPrevious: 3}
 
 var summaryTmpl = htmltemplate.Must(htmltemplate.New("summary").Funcs(htmltemplate.FuncMap{
 	"lower": strings.ToLower,
@@ -275,15 +334,32 @@ func renderSummary(w io.Writer, rows map[string]summaryRow, sev severitySet) err
 			data.Severities = append(data.Severities, s)
 		}
 	}
+	// A previous-run row with the same label as a row of this run is an older
+	// version of that image (e.g. a re-exported tar): hide it.
+	current := map[string]bool{}
 	for _, r := range rows {
+		if r.Status != statusPrevious {
+			current[r.Label] = true
+		}
+	}
+	for _, r := range rows {
+		if r.Status == statusPrevious && current[r.Label] {
+			continue
+		}
 		data.Rows = append(data.Rows, r)
 		for s, n := range r.Counts {
 			data.Totals[s] += n
 		}
 		data.Total += r.Total
+		if r.Status == statusFailed || r.Status == statusSkipped {
+			data.Failed++
+		}
 	}
 	sort.Slice(data.Rows, func(i, j int) bool {
 		a, b := data.Rows[i], data.Rows[j]
+		if statusRank[a.Status] != statusRank[b.Status] {
+			return statusRank[a.Status] < statusRank[b.Status]
+		}
 		if a.Counts["CRITICAL"] != b.Counts["CRITICAL"] {
 			return a.Counts["CRITICAL"] > b.Counts["CRITICAL"]
 		}

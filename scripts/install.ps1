@@ -7,6 +7,9 @@
 # Usage (local, from extracted zip):
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #
+# Every download is verified against the release's SHA-256 checksums file.
+# Set $env:TRIVYSCAN_SKIP_CHECKSUM = "1" to install without verification (not recommended).
+#
 # Options:
 #   --force, -f      Force reinstall
 #   --uninstall, -u  Uninstall both Trivy and TrivyScan
@@ -49,7 +52,6 @@ $RepoName     = "trivyscan"
 $ApiUrl       = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
 $TrivyDir     = "C:\Program Files\Trivy"
 $TrivyScanDir = "C:\Program Files\TrivyScan"
-$TrivyZip     = "$env:TEMP\trivy.zip"
 $TempDir      = "$env:TEMP\trivyscan_install"
 
 # ScriptDir: directory where install.ps1 lives (for local mode)
@@ -130,36 +132,83 @@ $trivyscanUpdated = $false
 # Helper Functions
 # =========================================
 
-function Install-Trivy($latestVersion) {
-    $url = "https://github.com/aquasecurity/trivy/releases/download/v$latestVersion/trivy_${latestVersion}_Windows-${ArchTrivy}.zip"
+# New-TempDir returns an empty directory under $TempDir for one download.
+function New-TempDir($name) {
+    $dir = Join-Path $TempDir $name
+    if (Test-Path $dir) {
+        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    return $dir
+}
 
-    Write-Host "[INFO] Downloading Trivy from: $url"
+# Test-Checksum compares $File with the line for $Name in a goreleaser-style checksums file.
+function Test-Checksum($File, $SumsFile, $Name) {
+    if ($env:TRIVYSCAN_SKIP_CHECKSUM -eq "1") {
+        Write-Yellow "[WARN] TRIVYSCAN_SKIP_CHECKSUM=1: NOT verifying $Name"
+        return $true
+    }
+    $expected = $null
+    foreach ($line in Get-Content $SumsFile) {
+        $parts = $line -split '\s+', 2
+        if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $Name) {
+            $expected = $parts[0].ToLower()
+            break
+        }
+    }
+    if (-not $expected) {
+        Write-Red "[ERROR] No checksum for $Name in checksums file"
+        return $false
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $File).Hash.ToLower()
+    if ($expected -ne $actual) {
+        Write-Red "[ERROR] Checksum mismatch for $Name"
+        Write-Red "        expected $expected"
+        Write-Red "        got      $actual"
+        return $false
+    }
+    Write-Green "[OK] Checksum verified: $Name"
+    return $true
+}
+
+function Install-Trivy($latestVersion) {
+    # Asset names in trivy's checksums file are lowercase ("windows-64bit").
+    $base    = "https://github.com/aquasecurity/trivy/releases/download/v$latestVersion"
+    $asset   = "trivy_${latestVersion}_windows-${ArchTrivy}.zip"
+    $sums    = "trivy_${latestVersion}_checksums.txt"
+    $workDir = New-TempDir "trivy"
+    $zipPath = Join-Path $workDir $asset
+    $sumPath = Join-Path $workDir $sums
+
+    Write-Host "[INFO] Downloading Trivy from: $base/$asset"
     try {
-        Invoke-WebRequest -Uri $url -OutFile $TrivyZip
+        Invoke-WebRequest -Uri "$base/$asset" -OutFile $zipPath
+        Invoke-WebRequest -Uri "$base/$sums" -OutFile $sumPath
     } catch {
         Write-Red "[ERROR] Trivy download failed: $_"
         return $false
     }
 
+    if (-not (Test-Checksum $zipPath $sumPath $asset)) {
+        return $false
+    }
+
     Write-Host "[INFO] Extracting Trivy..."
-    if (-not (Test-Path $TrivyDir)) {
-        New-Item -ItemType Directory -Path $TrivyDir | Out-Null
-    }
+    $extractDir = Join-Path $workDir "extract"
+    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
-    Expand-Archive -Path $TrivyZip -DestinationPath $TrivyDir -Force
-    Remove-Item $TrivyZip -Force -ErrorAction SilentlyContinue
-
-    if (Test-Path "$TrivyDir\trivy\trivy.exe") {
-        Move-Item "$TrivyDir\trivy\trivy.exe" "$TrivyDir\trivy.exe" -Force
-        Remove-Item "$TrivyDir\trivy" -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    if (-not (Test-Path "$TrivyDir\trivy.exe")) {
+    $exe = Get-ChildItem $extractDir -Recurse -Filter "trivy.exe" | Select-Object -First 1
+    if (-not $exe) {
         Write-Red "[ERROR] trivy.exe not found after extraction"
         return $false
     }
 
-    return $true
+    if (-not (Test-Path $TrivyDir)) {
+        New-Item -ItemType Directory -Path $TrivyDir | Out-Null
+    }
+    Copy-Item $exe.FullName "$TrivyDir\trivy.exe" -Force
+
+    return (Test-Path "$TrivyDir\trivy.exe")
 }
 
 function Install-TrivyScan {
@@ -189,10 +238,10 @@ function Install-TrivyScan {
 
 function Get-TrivyScanBinary {
     # Try local mode first: check if binary exists alongside install.ps1
+    # (trivyscan_windows.exe is the name used by older release archives)
     $candidates = @(
-        "trivyscan_windows.exe",
         "trivyscan.exe",
-        "trivyscan"
+        "trivyscan_windows.exe"
     )
     foreach ($name in $candidates) {
         $localBinary = Join-Path $ScriptDir $name
@@ -205,9 +254,7 @@ function Get-TrivyScanBinary {
     # Remote mode: download from GitHub release
     Write-Yellow "[INFO] No local binary found. Downloading from GitHub releases..."
 
-    if (-not (Test-Path $TempDir)) {
-        New-Item -ItemType Directory -Path $TempDir | Out-Null
-    }
+    $workDir = New-TempDir "trivyscan"
 
     # Get latest release
     $release = $null
@@ -222,37 +269,45 @@ function Get-TrivyScanBinary {
     $version = $tagName -replace "^v", ""
     Write-Host "[INFO] Latest version: v$version"
 
-    # Find matching asset
-    $assetName = "trivyscan_${version}_${Arch}.zip"
+    # Find matching asset + checksums (names come from .goreleaser.yaml)
+    $assetName = "trivyscan_${version}_windows_${Arch}.zip"
+    $sumsName  = "trivyscan_${version}_checksums.txt"
     $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+    $sums  = $release.assets | Where-Object { $_.name -eq $sumsName } | Select-Object -First 1
 
-    if (-not $asset) {
-        Write-Red "[ERROR] Asset not found: $assetName"
+    if (-not $asset -or -not $sums) {
+        Write-Red "[ERROR] Asset not found: $assetName / $sumsName"
         Write-Host "        Available assets:"
         $release.assets | ForEach-Object { Write-Host "          $($_.name)" }
         return $null
     }
 
-    $zipPath = Join-Path $TempDir $assetName
+    $zipPath = Join-Path $workDir $assetName
+    $sumPath = Join-Path $workDir $sumsName
     Write-Host "[INFO] Downloading $assetName..."
     try {
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+        Invoke-WebRequest -Uri $sums.browser_download_url -OutFile $sumPath
     } catch {
         Write-Red "[ERROR] Download failed: $_"
         return $null
     }
 
+    if (-not (Test-Checksum $zipPath $sumPath $assetName)) {
+        return $null
+    }
+
     # Extract
     Write-Host "[INFO] Extracting..."
-    Expand-Archive -Path $zipPath -DestinationPath $TempDir -Force
+    $extractDir = Join-Path $workDir "extract"
+    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
-    # Find the trivyscan binary inside extracted files
-    $binary = Get-ChildItem $TempDir -Recurse -Filter "trivyscan_windows.exe" | Select-Object -First 1
+    $binary = Get-ChildItem $extractDir -Recurse -Filter "trivyscan.exe" | Select-Object -First 1
     if ($binary) {
         return $binary.FullName
     }
 
-    Write-Red "[ERROR] trivyscan_windows.exe not found in archive"
+    Write-Red "[ERROR] trivyscan.exe not found in archive"
     return $null
 }
 
@@ -301,21 +356,6 @@ Write-Host "[INFO] Checking TrivyScan..."
 
 $SourceExe = Get-TrivyScanBinary
 $TargetExe = Join-Path $TrivyScanDir "trivyscan.exe"
-
-# Rename trivyscan_windows.exe -> trivyscan.exe in local dir
-$localWinBinary = Join-Path $ScriptDir "trivyscan_windows.exe"
-$localRenamed   = Join-Path $ScriptDir "trivyscan.exe"
-if ((Test-Path $localWinBinary) -and (-not (Test-Path $localRenamed))) {
-    try {
-        Rename-Item $localWinBinary "trivyscan.exe" -Force
-        Write-Green "[OK] Renamed trivyscan_windows.exe -> trivyscan.exe"
-        if ($SourceExe -eq $localWinBinary) {
-            $SourceExe = $localRenamed
-        }
-    } catch {
-        Write-Yellow "[WARN] Cannot rename local binary: $_"
-    }
-}
 
 $currentTrivyscan = $null
 

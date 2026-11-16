@@ -12,6 +12,10 @@
     .count-total { font-family: var(--mono); font-weight: 700; color: var(--tx3); }
     .digest { display: block; margin-top: 4px; font-size: 12px; }
     tfoot td { font-weight: 700; background: var(--bg3); border-top: 1px solid var(--bd); }
+    .row-error { display: block; margin-top: 4px; font-family: var(--mono); font-size: 12px; color: var(--critical); white-space: normal; }
+    tbody tr.row-previous td { opacity: .6; }
+    .card.failed { border-left: 3px solid var(--critical); }
+    .card.failed .card-value { color: var(--critical); }
   </style>
 </head>
 <body>
@@ -35,6 +39,12 @@
       <div class="card-label">Total</div>
       <div class="card-value">{{ .Total }}</div>
     </div>
+    {{- if .Failed }}
+    <div class="card failed">
+      <div class="card-label">Failed</div>
+      <div class="card-value">{{ .Failed }}</div>
+    </div>
+    {{- end }}
     {{- range .Severities }}
     {{- if ne . "UNKNOWN" }}
     <div class="card {{ lower . }}">
@@ -66,6 +76,7 @@
           <thead>
           <tr>
             <th scope="col">Image</th>
+            <th scope="col">Status</th>
             <th scope="col">OS</th>
             {{- range .Severities }}
             <th scope="col" class="num">{{ title . }}</th>
@@ -78,30 +89,41 @@
           <tbody>
           {{- range .Rows }}
           {{- $row := . }}
-          <tr{{ if .Highest }} class="severity-{{ .Highest }}"{{ end }}>
+          {{- $scanned := or (eq .Status "ok") (eq .Status "previous") }}
+          <tr class="{{ if .Highest }}severity-{{ .Highest }}{{ end }}{{ if eq .Status "previous" }} row-previous{{ end }}">
             <td>
               <span class="package-name">{{ .Label }}</span>
               {{- if .Digest }}
               <span class="version digest">{{ .Digest }}</span>
               {{- end }}
+              {{- if .Error }}
+              <span class="row-error">{{ .Error }}</span>
+              {{- end }}
+            </td>
+            <td>
+              {{- if eq .Status "failed" }}<span class="severity-badge CRITICAL">Failed</span>
+              {{- else if eq .Status "skipped" }}<span class="severity-badge UNKNOWN">Skipped</span>
+              {{- else if eq .Status "previous" }}<span class="version">Previous run</span>
+              {{- else }}<span class="version version-fixed">OK</span>{{ end -}}
             </td>
             <td><span class="version">{{ .OS }}</span></td>
             {{- range $.Severities }}
             {{- $n := index $row.Counts . }}
             <td class="num">
-              {{- if $n }}<span class="severity-badge {{ . }}">{{ $n }}</span>
+              {{- if not $scanned }}<span class="count-zero">-</span>
+              {{- else if $n }}<span class="severity-badge {{ . }}">{{ $n }}</span>
               {{- else }}<span class="count-zero">0</span>{{ end -}}
             </td>
             {{- end }}
-            <td class="num"><span class="count-total">{{ .Total }}</span></td>
+            <td class="num">{{ if $scanned }}<span class="count-total">{{ .Total }}</span>{{ else }}<span class="count-zero">-</span>{{ end }}</td>
             <td><span class="version-empty">{{ .Scanned }}</span></td>
-            <td><a href="{{ .Href }}" class="ref-link">View report</a></td>
+            <td>{{ if .Href }}<a href="{{ .Href }}" class="ref-link">View report</a>{{ else }}<span class="count-zero">-</span>{{ end }}</td>
           </tr>
           {{- end }}
           </tbody>
           <tfoot>
           <tr>
-            <td colspan="2">Total</td>
+            <td colspan="3">Total</td>
             {{- range .Severities }}
             <td class="num">{{ index $.Totals . }}</td>
             {{- end }}

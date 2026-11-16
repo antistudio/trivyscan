@@ -76,12 +76,14 @@ trivyscan [flags]
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `--input` | `-i` | Image references, `.tar`/`.tar.gz`/`.tgz` files or directories; comma-separated or repeated | *required* (or `-l`) |
-| `--list` | `-l` | File with one input per line (`#` comments allowed) | |
+| `--input` | `-i` | Image references, `.tar`/`.tar.gz`/`.tgz` files or directories; comma-separated or repeated (use `-l` for paths containing commas) | *required* (or `-l`) |
+| `--list` | `-l` | File with one input per line (`#` comments allowed); relative paths are resolved next to the list file | |
 | `--output` | `-o` | Output directory (`json/`, `html/`, `summary.html`) | `.` |
-| `--severity` | `-s` | Severity levels shown in reports (render-time filter) | all |
+| `--severity` | `-s` | Severity levels shown in reports (render-time filter); unknown names are an error | all |
 | `--scanner` | `-S` | Trivy scanners (`vuln,misconfig,secret,license`) | Trivy default |
-| `--force` | `-f` | Rescan even if an up-to-date JSON report exists | `false` |
+| `--force` | `-f` | Rescan (and re-hash) even if an up-to-date JSON report exists | `false` |
+| `--fail-on` | `-fo` | Exit `2` if a vulnerability at or above this severity is found (independent of `-s`) | off |
+| `--prune` | `-p` | Delete reports in the output directory that are not part of this run | `false` |
 | `--timeout` | `-t` | Timeout per scan | `10m` |
 | `--max-retries` | `-rt` | Max retry attempts for transient errors | `3` |
 | `--max-depth` | `-md` | Max directory depth when scanning a folder | `5` |
@@ -129,14 +131,26 @@ ghcr.io/org/app@sha256:<digest>
   (`[registry[:port]/]name[:tag][@digest]`, lowercase name) is treated as an image.
 - Trivy looks for the image in Docker, containerd, Podman, then the remote registry.
   Private registries use your `docker login` credentials, or `TRIVY_USERNAME`/`TRIVY_PASSWORD`.
-- Image references are always rescanned (a tag can move); only `.tar` inputs reuse an up-to-date JSON.
+- Image references are always rescanned (a tag can move); only `.tar` inputs reuse an up-to-date JSON,
+  so changing `-s` for a list of images scans them again.
+- The same image written two ways (`nginx` and `docker.io/library/nginx:latest`) is scanned twice.
 - An unknown tag/repository or a denied pull fails immediately instead of being retried.
 
-### CI/CD (Skip DB Update)
+### CI/CD (Skip DB Update, fail the build on HIGH or worse)
 
 ```bash
-trivyscan -i app.tar -o ./reports -sd -s CRITICAL,HIGH
+trivyscan -i app.tar -o ./reports -sd --fail-on HIGH
 ```
+
+### Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Every target scanned, nothing at or above `--fail-on` |
+| `1` | Invalid flags, or at least one target failed to scan |
+| `2` | Every target scanned, but a vulnerability at or above `--fail-on` was found |
+
+A scan failure takes precedence over `--fail-on` (exit `1`).
 
 ## Output
 
@@ -146,6 +160,7 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
 ./reports/
 ├── summary.html                  # all images: OS, severity counts, link to detail page
 ├── json/
+│   ├── .hashes.json              # cache of tar hashes (path, size, mtime)
 │   ├── nginx_a3f9c2.json         # full Trivy JSON (all severities)
 │   └── api-server_7b8d1e.json
 └── html/
@@ -157,8 +172,12 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
   (or from the reference string for image references).
 - JSON always contains every severity; `-s` only filters what the HTML pages show.
 - On the next run, a tar whose JSON is newer than the Trivy DB is not rescanned, only re-rendered.
-  Changing `-s` is therefore instant. Use `--force` to rescan anyway (e.g. after changing `-S`).
-- `summary.html` also lists reports from earlier runs that are still in `json/`.
+  Its hash is cached by size and modification time, so unchanged tars are not even re-read.
+  Changing `-s` is therefore instant. Use `--force` to rescan and re-hash anyway (e.g. after changing `-S`).
+- `summary.html` shows a status for every target: **OK**, **Failed** (with the reason), **Skipped** (invalid tar),
+  and **Previous run** for reports from earlier runs still in `json/`. A previous-run report is hidden when an image
+  with the same name was scanned in this run (e.g. an older export of the same tar).
+- `--prune` deletes `json/` and `html/` reports that are not part of the current run (never when the run was cancelled).
 - `json/` and `html/` are output artifacts; add them to `.gitignore` if the output directory is inside a repository.
 
 ## CI/CD Integration
@@ -169,9 +188,10 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
 - name: Security Scan
   run: |
     go install github.com/anhnmt/trivyscan@latest
-    trivyscan -i myapp.tar -o ./reports -s CRITICAL,HIGH
-    
+    trivyscan -i myapp.tar -o ./reports --fail-on HIGH
+
 - name: Upload Reports
+  if: always()  # keep the reports when --fail-on fails the scan step
   uses: actions/upload-artifact@v3
   with:
     name: security-reports
@@ -184,8 +204,9 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
 security-scan:
   script:
     - go install github.com/anhnmt/trivyscan@latest
-    - trivyscan -i image.tar -o ./reports -s CRITICAL,HIGH
+    - trivyscan -i image.tar -o ./reports --fail-on HIGH
   artifacts:
+    when: always
     paths:
       - ./reports/
 ```

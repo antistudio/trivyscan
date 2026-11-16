@@ -6,13 +6,30 @@ before:
   hooks:
     - go mod tidy
 
+# Two builds of the same package so each archive can ship only its own installer.
+# main must be the package (.), not ./main.go: the code is split over several files.
 builds:
-  - id: trivyscan
-    main: ./main.go
-    binary: "trivyscan_{{ .Os }}"
+  - id: trivyscan-unix
+    main: .
+    binary: trivyscan
     goos:
       - linux
       - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+    flags:
+      - -tags=net
+    env:
+      - CGO_ENABLED=0
+
+  - id: trivyscan-windows
+    main: .
+    binary: trivyscan
+    goos:
       - windows
     goarch:
       - amd64
@@ -25,48 +42,28 @@ builds:
     env:
       - CGO_ENABLED=0
 
+# One archive per OS/arch: trivyscan_<ver>_<os>_<arch>.tar.gz (zip on Windows).
+# scripts/install.sh and install.ps1 download these names; keep them in sync.
 archives:
-  - id: amd64
-    formats: [zip]
-    name_template: "{{ .ProjectName }}_{{ .Version }}_amd64"
-    meta: true
+  - id: unix
+    ids: [trivyscan-unix]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
-      - INSTALL*
+      - INSTALL.md
+      - LICENSE
       - src: scripts/install.sh
-        dst: .
-        strip_parent: true
-      - src: scripts/install.ps1
-        dst: .
-        strip_parent: true
-      - src: "dist/trivyscan_linux_amd64_v1/trivyscan_linux"
-        dst: .
-        strip_parent: true
-      - src: "dist/trivyscan_darwin_amd64_v1/trivyscan_darwin"
-        dst: .
-        strip_parent: true
-      - src: "dist/trivyscan_windows_amd64_v1/trivyscan_windows.exe"
         dst: .
         strip_parent: true
 
-  - id: arm64
+  - id: windows
+    ids: [trivyscan-windows]
     formats: [zip]
-    name_template: "{{ .ProjectName }}_{{ .Version }}_arm64"
-    meta: true
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
-      - INSTALL*
-      - src: scripts/install.sh
-        dst: .
-        strip_parent: true
+      - INSTALL.md
+      - LICENSE
       - src: scripts/install.ps1
-        dst: .
-        strip_parent: true
-      - src: "dist/trivyscan_linux_arm64_v8.0/trivyscan_linux"
-        dst: .
-        strip_parent: true
-      - src: "dist/trivyscan_darwin_arm64_v8.0/trivyscan_darwin"
-        dst: .
-        strip_parent: true
-      - src: "dist/trivyscan_windows_arm64_v8.0/trivyscan_windows.exe"
         dst: .
         strip_parent: true
 
@@ -74,6 +71,7 @@ snapshot:
   version_template: "dev"
 
 checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
   algorithm: sha256
 
 release:

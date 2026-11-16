@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,13 +45,15 @@ const (
 	trivySkipJavaDB     = "--skip-java-db-update"
 	trivyInstallURL     = "https://aquasecurity.github.io/trivy/latest/getting-started/installation/"
 	hashLength          = 6
+	minTrivyVersion     = "0.70.0"
 )
 
 // Output layout: <out>/json/<stem>.json, <out>/html/<stem>.html, <out>/summary.html
 const (
-	jsonSubdir  = "json"
-	htmlSubdir  = "html"
-	summaryFile = "summary.html"
+	jsonSubdir    = "json"
+	htmlSubdir    = "html"
+	summaryFile   = "summary.html"
+	hashCacheFile = ".hashes.json" // inside jsonSubdir; dot prefix keeps it apart from reports
 )
 
 const (
@@ -74,6 +77,8 @@ type options struct {
 	SkipDBUpdate   bool
 	SkipTrivyCheck bool
 	Force          bool
+	Prune          bool
+	FailOn         string
 	Version        bool
 	MaxRetries     int
 	MaxDepth       int
@@ -191,6 +196,10 @@ func scanOne(ctx context.Context, target scanTarget, jsonPath, scanner string, t
 		if err == nil {
 			return scanResult{Target: target, JSONFile: jsonPath, Duration: time.Since(start)}
 		}
+		// trivy was killed because the run was cancelled, not because the scan failed
+		if ctx.Err() != nil {
+			return scanResult{Target: target, Error: fmt.Errorf("cancelled: %w", ctx.Err()), Duration: time.Since(start)}
+		}
 
 		// Invalid tar — skip immediately, no retry (not applicable to image refs)
 		if target.Kind == inputTypeTar && isInvalidImageError(err) {
@@ -305,7 +314,25 @@ func checkTrivyInstalled(ctx context.Context) error {
 		return buildTrivyNotFoundError()
 	}
 	log.Info().Msgf("Trivy: %s", strings.TrimSpace(string(output)))
+	if v := trivyVersionRe.FindStringSubmatch(string(output)); v != nil && versionLess(v[1], minTrivyVersion) {
+		log.Warn().Str("version", v[1]).Str("minimum", minTrivyVersion).Msg("Trivy is older than the tested minimum, results may differ")
+	}
 	return nil
+}
+
+var trivyVersionRe = regexp.MustCompile(`Version:\s*v?(\d+\.\d+\.\d+)`)
+
+// versionLess compares dotted numeric versions like 0.76.2.
+func versionLess(a, b string) bool {
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		na, _ := strconv.Atoi(pa[i])
+		nb, _ := strconv.Atoi(pb[i])
+		if na != nb {
+			return na < nb
+		}
+	}
+	return len(pa) < len(pb)
 }
 
 func buildTrivyNotFoundError() error {
@@ -420,11 +447,20 @@ func resolveInputs(inputs []string, maxDepth int) ([]scanTarget, error) {
 			return nil, err
 		}
 		for _, t := range resolved {
-			if seen[t.Input] {
+			key := t.Input
+			if t.Kind == inputTypeTar {
+				// ./a.tar, a.tar and a symlinked path are the same file
+				if real, err := filepath.EvalSymlinks(t.Input); err == nil {
+					if abs, err := filepath.Abs(real); err == nil {
+						key = abs
+					}
+				}
+			}
+			if seen[key] {
 				log.Debug().Str("input", t.Input).Msg("Duplicate target, skipping")
 				continue
 			}
-			seen[t.Input] = true
+			seen[key] = true
 			targets = append(targets, t)
 		}
 	}
@@ -432,6 +468,8 @@ func resolveInputs(inputs []string, maxDepth int) ([]scanTarget, error) {
 }
 
 // readTargetList reads one input per line from path; blank lines and # comments are ignored.
+// Relative paths that exist next to the list file are resolved against its directory;
+// anything else (image references, cwd-relative paths) is kept as written.
 func readTargetList(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -442,9 +480,17 @@ func readTargetList(path string) ([]string, error) {
 		if i := strings.Index(line, "#"); i >= 0 {
 			line = line[:i]
 		}
-		if line = strings.TrimSpace(line); line != "" {
-			inputs = append(inputs, line)
+		if line = strings.TrimSpace(line); line == "" {
+			continue
 		}
+		if !filepath.IsAbs(line) {
+			if candidate := filepath.Join(filepath.Dir(path), line); candidate != line {
+				if _, err := os.Stat(candidate); err == nil {
+					line = candidate
+				}
+			}
+		}
+		inputs = append(inputs, line)
 	}
 	return inputs, nil
 }
@@ -545,34 +591,100 @@ func calculateBackoff(attempt int) time.Duration {
 	return time.Duration(b + jitter)
 }
 
-func fileHash(filePath string) (string, error) {
+// fileHash returns the first hashLength hex chars of the file's SHA-256.
+// It reads in chunks so a large tar can be interrupted with Ctrl+C.
+func fileHash(ctx context.Context, filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	buf := make([]byte, 1<<20)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, err := f.Read(buf)
+		h.Write(buf[:n])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:hashLength], nil
+}
+
+// hashCache remembers tar hashes by absolute path, size and mtime, so unchanged
+// tars are not re-read on every run.
+type hashCache struct {
+	path    string
+	entries map[string]hashEntry
+}
+
+type hashEntry struct {
+	Size    int64
+	ModTime time.Time
+	Hash    string
+}
+
+// loadHashCache reads the cache; a missing or corrupt file starts an empty one.
+func loadHashCache(path string) *hashCache {
+	c := &hashCache{path: path, entries: map[string]hashEntry{}}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &c.entries); err != nil {
+			log.Warn().Str("file", path).Err(err).Msg("Ignoring corrupt hash cache")
+			c.entries = map[string]hashEntry{}
+		}
+	}
+	return c
+}
+
+// hash returns the content hash of file, reusing the cached value when size
+// and mtime are unchanged (unless force).
+func (c *hashCache) hash(ctx context.Context, file string, force bool) (string, error) {
+	abs, err := filepath.Abs(file)
+	if err != nil {
 		return "", err
 	}
-	hash := hex.EncodeToString(h.Sum(nil))
-	if len(hash) < hashLength {
-		return hash, nil
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", err
 	}
-	return hash[:hashLength], nil
+	if e, ok := c.entries[abs]; ok && !force && e.Size == info.Size() && e.ModTime.Equal(info.ModTime()) {
+		log.Debug().Str("file", file).Msg("Hash cached")
+		return e.Hash, nil
+	}
+	h, err := fileHash(ctx, abs)
+	if err != nil {
+		return "", err
+	}
+	c.entries[abs] = hashEntry{Size: info.Size(), ModTime: info.ModTime(), Hash: h}
+	return h, nil
+}
+
+// save writes the cache, dropping entries whose file no longer exists
+// and, when keep is not nil, entries not in keep.
+func (c *hashCache) save(keep map[string]bool) error {
+	for p := range c.entries {
+		if _, err := os.Stat(p); err != nil || (keep != nil && !keep[p]) {
+			delete(c.entries, p)
+		}
+	}
+	return writeFileAtomic(c.path, func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(c.entries)
+	})
 }
 
 // reportStem returns the report file name without extension: <base>_<hash6>.
-func reportStem(input string) string {
-	// For image references (e.g. nginx:latest), hash the string itself
-	// since there is no file to read.
-	var hash string
-	if _, err := os.Stat(input); err == nil {
-		h, err := fileHash(input)
-		if err == nil {
-			hash = h
-		}
-	}
+// contentHash is the tar's hash; empty for image references, which are hashed
+// by their name since there is no file to read.
+func reportStem(input, contentHash string) string {
+	hash := contentHash
 	if hash == "" {
 		h := sha256.Sum256([]byte(input))
 		hash = hex.EncodeToString(h[:])[:hashLength]
@@ -639,18 +751,51 @@ func loadPreviousReports(outputDir string, targets []scanTarget, sev severitySet
 	}
 	files, _ := filepath.Glob(filepath.Join(outputDir, jsonSubdir, "*.json"))
 	for _, jsonPath := range files {
-		stem := strings.TrimSuffix(filepath.Base(jsonPath), ".json")
-		if current[stem] {
+		name := filepath.Base(jsonPath)
+		stem := strings.TrimSuffix(name, ".json")
+		// Go's Glob matches dotfiles too; .hashes.json is not a report.
+		if strings.HasPrefix(name, ".") || current[stem] {
 			continue
 		}
 		if _, row, err := publishReport(outputDir, stem, jsonPath, sev); err != nil {
 			log.Warn().Str("file", jsonPath).Err(err).Msg("Skipping unreadable report from previous run")
 		} else {
+			row.Status = statusPrevious
 			rows[stem] = row
 		}
 	}
 	if len(rows) > 0 {
 		log.Info().Int("count", len(rows)).Msg("Loaded reports from previous runs")
+	}
+}
+
+// pruneReports removes JSON/HTML reports whose stem is not in keep, plus any
+// leftover .tmp files. Only files directly in json/ and html/ are touched.
+func pruneReports(outputDir string, keep map[string]bool) {
+	for _, dir := range []struct{ name, ext string }{{jsonSubdir, ".json"}, {htmlSubdir, ".html"}} {
+		entries, err := os.ReadDir(filepath.Join(outputDir, dir.name))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || strings.HasPrefix(name, ".") {
+				continue
+			}
+			stale := strings.HasSuffix(name, ".tmp")
+			if !stale && strings.HasSuffix(name, dir.ext) {
+				stale = !keep[strings.TrimSuffix(name, dir.ext)]
+			}
+			if !stale {
+				continue
+			}
+			path := filepath.Join(outputDir, dir.name, name)
+			if err := os.Remove(path); err != nil {
+				log.Warn().Str("file", path).Err(err).Msg("Prune failed")
+			} else {
+				log.Info().Str("file", path).Msg("Pruned")
+			}
+		}
 	}
 }
 
@@ -674,7 +819,9 @@ func run() int {
 		flagSet.BoolVarP(&opts.OnlyUpdate, "update", "u", false, "only update database and exit"),
 		flagSet.BoolVarP(&opts.SkipDBUpdate, "skip-db-update", "sd", false, "skip database update"),
 		flagSet.BoolVarP(&opts.SkipTrivyCheck, "skip-trivy-check", "st", false, "skip trivy installation check"),
-		flagSet.BoolVarP(&opts.Force, "force", "f", false, "rescan even if an up-to-date JSON report exists"),
+		flagSet.BoolVarP(&opts.Force, "force", "f", false, "rescan (and rehash) even if an up-to-date JSON report exists"),
+		flagSet.BoolVarP(&opts.Prune, "prune", "p", false, "delete reports in the output directory that are not part of this run"),
+		flagSet.StringVarP(&opts.FailOn, "fail-on", "fo", "", "exit 2 when a vulnerability at or above this severity is found (e.g. HIGH)"),
 		flagSet.IntVarP(&opts.MaxRetries, "max-retries", "rt", defaultMaxRetries, "max retry attempts"),
 		flagSet.IntVarP(&opts.MaxDepth, "max-depth", "md", defaultMaxDepth, "max directory depth"),
 		flagSet.DurationVarP(&opts.Timeout, "timeout", "t", defaultScanTimeout, "timeout per scan"),
@@ -692,8 +839,29 @@ func run() int {
 		return 0
 	}
 
+	sev, err := parseSeverity(opts.Severity)
+	if err != nil {
+		log.Error().Err(err).Msg("Invalid --severity")
+		return 1
+	}
+	failOn := strings.ToUpper(strings.TrimSpace(opts.FailOn))
+	if failOn != "" && !isSeverity(failOn) {
+		log.Error().Str("fail_on", opts.FailOn).Strs("valid", summarySeverities).Msg("Invalid --fail-on")
+		return 1
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigChan
+		// Restore default handling: a second Ctrl+C terminates immediately.
+		signal.Stop(sigChan)
+		log.Warn().Str("signal", sig.String()).Msg("Shutdown signal received, finishing up (press Ctrl+C again to force exit)")
+		cancel()
+	}()
 
 	if opts.OnlyUpdate {
 		if err := updateTrivyDB(ctx); err != nil {
@@ -730,14 +898,6 @@ func run() int {
 		return 1
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		sig := <-sigChan
-		log.Warn().Str("signal", sig.String()).Msg("Shutdown signal received")
-		cancel()
-	}()
-
 	if !opts.SkipTrivyCheck {
 		if err := checkTrivyInstalled(ctx); err != nil {
 			log.Error().Err(err).Msg("Trivy check failed")
@@ -767,13 +927,35 @@ func run() int {
 		return 1
 	}
 
-	// Hash each input once; the stem is reused for retries and all output files.
+	// Hash each tar once (cached by size+mtime); the stem is reused for retries and all output files.
 	log.Info().Int("targets", len(targets)).Msg("Hashing inputs")
+	hashes := loadHashCache(filepath.Join(jsonDir, hashCacheFile))
+	usedHashes := map[string]bool{}
 	for i := range targets {
-		targets[i].Stem = reportStem(targets[i].Input)
+		var h string
+		if targets[i].Kind == inputTypeTar {
+			h, err = hashes.hash(ctx, targets[i].Input, opts.Force)
+			if ctx.Err() != nil {
+				log.Warn().Msg("Cancelled while hashing inputs")
+				return 1
+			}
+			if err != nil {
+				log.Warn().Str("input", targets[i].Input).Err(err).Msg("Cannot hash input, naming report by path")
+			}
+			if abs, err := filepath.Abs(targets[i].Input); err == nil {
+				usedHashes[abs] = true
+			}
+		}
+		targets[i].Stem = reportStem(targets[i].Input, h)
+	}
+	var keepHashes map[string]bool // nil keeps cached hashes of other tars
+	if opts.Prune {
+		keepHashes = usedHashes
+	}
+	if err := hashes.save(keepHashes); err != nil {
+		log.Warn().Err(err).Msg("Cannot save hash cache")
 	}
 
-	sev := parseSeverity(opts.Severity)
 	rows := map[string]summaryRow{}
 	summaryPath := filepath.Join(opts.Output, summaryFile)
 	summaryFailed := false
@@ -784,7 +966,9 @@ func run() int {
 		}
 	}
 
-	loadPreviousReports(opts.Output, targets, sev, rows)
+	if !opts.Prune {
+		loadPreviousReports(opts.Output, targets, sev, rows)
+	}
 
 	dbTime, haveDBTime := dbDownloadedAt()
 	if !haveDBTime && !opts.Force {
@@ -834,9 +1018,25 @@ func run() int {
 			successResults = append(successResults, result)
 		case result.Skipped:
 			skippedResults = append(skippedResults, result)
+			rows[target.Stem] = errorRow(target, statusSkipped, result.Error)
+			writeSummary()
 		default:
 			log.Error().Str("input", result.Target.Input).Err(result.Error).Msg("Failed, continuing to next target")
 			failResults = append(failResults, result)
+			rows[target.Stem] = errorRow(target, statusFailed, result.Error)
+			writeSummary()
+		}
+	}
+
+	if opts.Prune {
+		if ctx.Err() != nil {
+			log.Warn().Msg("Run was cancelled, skipping --prune")
+		} else {
+			keep := make(map[string]bool, len(targets))
+			for _, t := range targets {
+				keep[t.Stem] = true
+			}
+			pruneReports(opts.Output, keep)
 		}
 	}
 
@@ -871,6 +1071,18 @@ func run() int {
 
 	if len(failResults) > 0 || summaryFailed {
 		return 1
+	}
+	if failOn != "" {
+		var over []string
+		for _, r := range successResults {
+			if w := rows[r.Target.Stem].Worst; w != "" && atLeast(w, failOn) {
+				over = append(over, r.Target.Input)
+			}
+		}
+		if len(over) > 0 {
+			log.Error().Str("fail_on", failOn).Strs("targets", over).Msg("Vulnerabilities at or above threshold")
+			return 2
+		}
 	}
 	return 0
 }

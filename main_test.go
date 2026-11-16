@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -22,6 +23,26 @@ import (
 
 var timestampRe = regexp.MustCompile(`\d{4}-\d{2}-\d{2} \d{2}:\d{2}`)
 
+// requireTestdata skips the test when fixtures are missing: testdata/ is not
+// committed, so CI runs everything else and these only run where it exists.
+func requireTestdata(t *testing.T, files ...string) {
+	t.Helper()
+	for _, f := range files {
+		if _, err := os.Stat(f); err != nil {
+			t.Skipf("%s not present (testdata/ is not committed)", f)
+		}
+	}
+}
+
+func mustSeverity(t *testing.T, s string) severitySet {
+	t.Helper()
+	sev, err := parseSeverity(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sev
+}
+
 func TestRenderDetailMatchesTrivyConvert(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -35,12 +56,13 @@ func TestRenderDetailMatchesTrivyConvert(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			requireTestdata(t, tt.input, tt.golden)
 			rep, err := loadReport(tt.input)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var got bytes.Buffer
-			if err := renderDetail(&got, rep, parseSeverity(tt.severity)); err != nil {
+			if err := renderDetail(&got, rep, mustSeverity(t, tt.severity)); err != nil {
 				t.Fatal(err)
 			}
 			want, err := os.ReadFile(tt.golden)
@@ -74,6 +96,7 @@ func firstDiff(want, got string) string {
 }
 
 func TestSummary(t *testing.T) {
+	requireTestdata(t, "testdata/report.json", "testdata/empty.json")
 	rep, err := loadReport("testdata/report.json")
 	if err != nil {
 		t.Fatal(err)
@@ -90,8 +113,8 @@ func TestSummary(t *testing.T) {
 			t.Errorf("Counts[%s] = %d, want %d", s, row.Counts[s], n)
 		}
 	}
-	if row.Total != 9 || row.Highest != "CRITICAL" {
-		t.Errorf("Total=%d Highest=%q, want 9 CRITICAL", row.Total, row.Highest)
+	if row.Total != 9 || row.Highest != "CRITICAL" || row.Worst != "CRITICAL" || row.Status != statusOK {
+		t.Errorf("Total=%d Highest=%q Worst=%q Status=%q, want 9 CRITICAL CRITICAL ok", row.Total, row.Highest, row.Worst, row.Status)
 	}
 	if row.Label != "app:1.0" || row.OS != "alpine 3.19.1" || row.Digest != "0123456789ab" {
 		t.Errorf("Label=%q OS=%q Digest=%q", row.Label, row.OS, row.Digest)
@@ -100,13 +123,13 @@ func TestSummary(t *testing.T) {
 		t.Errorf("Href = %q", row.Href)
 	}
 
-	filtered := summarize("app_abc123", "testdata/report.json", rep, parseSeverity("critical, high"))
-	if filtered.Total != 4 || filtered.Counts["MEDIUM"] != 0 {
+	filtered := summarize("app_abc123", "testdata/report.json", rep, mustSeverity(t, "critical, high"))
+	if filtered.Total != 4 || filtered.Counts["MEDIUM"] != 0 || filtered.Worst != "CRITICAL" {
 		t.Errorf("-s CRITICAL,HIGH: Total=%d Counts=%v, want 4 without MEDIUM", filtered.Total, filtered.Counts)
 	}
 
 	clean := summarize("clean_def456", "testdata/empty.json", empty, nil)
-	if clean.Label != "clean.tar" || clean.OS != "-" || clean.Total != 0 || clean.Highest != "" {
+	if clean.Label != "clean.tar" || clean.OS != "-" || clean.Total != 0 || clean.Highest != "" || clean.Worst != "" {
 		t.Errorf("clean row = %+v", clean)
 	}
 
@@ -133,7 +156,7 @@ func TestSummary(t *testing.T) {
 	}
 
 	buf.Reset()
-	if err := renderSummary(&buf, map[string]summaryRow{}, parseSeverity("CRITICAL,HIGH")); err != nil {
+	if err := renderSummary(&buf, map[string]summaryRow{}, mustSeverity(t, "CRITICAL,HIGH")); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(buf.String(), "No Reports Found") || strings.Contains(buf.String(), ">Medium</th>") {
@@ -152,6 +175,7 @@ func TestDetailCSS(t *testing.T) {
 }
 
 func TestLoadPreviousReports(t *testing.T) {
+	requireTestdata(t, "testdata/report.json")
 	out := t.TempDir()
 	jsonDir := filepath.Join(out, jsonSubdir)
 	if err := os.MkdirAll(jsonDir, 0o755); err != nil {
@@ -165,6 +189,7 @@ func TestLoadPreviousReports(t *testing.T) {
 		"old_111111.json":     data,
 		"current_222222.json": data,
 		"broken_333333.json":  []byte("{not json"),
+		hashCacheFile:         []byte(`{"/x.tar":{"Size":1,"ModTime":"2026-01-01T00:00:00Z","Hash":"abcdef"}}`),
 	} {
 		if err := os.WriteFile(filepath.Join(jsonDir, name), content, 0o644); err != nil {
 			t.Fatal(err)
@@ -174,8 +199,8 @@ func TestLoadPreviousReports(t *testing.T) {
 	rows := map[string]summaryRow{}
 	loadPreviousReports(out, []scanTarget{{Stem: "current_222222"}}, nil, rows)
 
-	if _, ok := rows["old_111111"]; !ok || len(rows) != 1 {
-		t.Fatalf("rows = %v, want only old_111111 (current is rescanned, broken is skipped)", rows)
+	if row, ok := rows["old_111111"]; !ok || len(rows) != 1 || row.Status != statusPrevious {
+		t.Fatalf("rows = %v, want only old_111111 marked previous (current is rescanned, broken and .hashes.json are skipped)", rows)
 	}
 	if _, err := os.Stat(filepath.Join(out, htmlSubdir, "old_111111.html")); err != nil {
 		t.Errorf("detail page for previous report not rendered: %v", err)
@@ -189,10 +214,14 @@ func TestReportStem(t *testing.T) {
 		t.Fatal(err)
 	}
 	// sha256("content") = ed7002...
-	if got := reportStem(tar); got != "My.Image_ed7002" {
+	h, err := fileHash(context.Background(), tar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reportStem(tar, h); got != "My.Image_ed7002" {
 		t.Errorf("reportStem(tar) = %q", got)
 	}
-	if got := reportStem("registry.io/app:1.0"); !strings.HasPrefix(got, "app_1.0_") {
+	if got := reportStem("registry.io/app:1.0", ""); !strings.HasPrefix(got, "app_1.0_") {
 		t.Errorf("reportStem(image ref) = %q", got)
 	}
 }
@@ -310,5 +339,230 @@ func TestReadTargetList(t *testing.T) {
 	}
 	if want := "nginx:latest|app:dev|images/old.tar"; strings.Join(got, "|") != want {
 		t.Errorf("readTargetList = %q, want %s", got, want)
+	}
+}
+
+func TestParseSeverity(t *testing.T) {
+	if sev, err := parseSeverity(" critical,High ,"); err != nil || !sev.has("CRITICAL") || !sev.has("high") || sev.has("LOW") {
+		t.Errorf("parseSeverity valid = %v, %v", sev, err)
+	}
+	if sev, err := parseSeverity(""); err != nil || sev != nil {
+		t.Errorf("empty -s should mean all severities, got %v, %v", sev, err)
+	}
+	if _, err := parseSeverity("CRITICAL,CRTICAL"); err == nil || !strings.Contains(err.Error(), "CRTICAL") {
+		t.Errorf("typo must be rejected, got %v", err)
+	}
+}
+
+func TestAtLeast(t *testing.T) {
+	for _, tt := range []struct {
+		sev, level string
+		want       bool
+	}{
+		{"CRITICAL", "HIGH", true},
+		{"HIGH", "HIGH", true},
+		{"MEDIUM", "HIGH", false},
+		{"UNKNOWN", "LOW", false},
+		{"UNKNOWN", "UNKNOWN", true},
+		{"LOW", "UNKNOWN", true},
+	} {
+		if got := atLeast(tt.sev, tt.level); got != tt.want {
+			t.Errorf("atLeast(%s, %s) = %v, want %v", tt.sev, tt.level, got, tt.want)
+		}
+	}
+}
+
+func TestSummaryStatusRows(t *testing.T) {
+	ok := summaryRow{Stem: "app_new", Label: "app:1.0", Status: statusOK, Href: "html/app_new.html", Counts: map[string]int{"HIGH": 1}, Total: 1, Highest: "HIGH"}
+	superseded := summaryRow{Stem: "app_old", Label: "app:1.0", Status: statusPrevious, Href: "html/app_old.html", Counts: map[string]int{"CRITICAL": 5}, Total: 5}
+	previous := summaryRow{Stem: "redis_aaa", Label: "redis:7", Status: statusPrevious, Href: "html/redis_aaa.html", Counts: map[string]int{}}
+	failed := errorRow(scanTarget{Stem: "x_1", Input: "alpine:no-such-tag"}, statusFailed, errors.New("MANIFEST_UNKNOWN: <manifest> unknown\n  details"))
+	skipped := errorRow(scanTarget{Stem: "y_2", Input: "broken.tar"}, statusSkipped, errors.New(strings.Repeat("é", 300)))
+
+	var buf bytes.Buffer
+	rows := map[string]summaryRow{ok.Stem: ok, superseded.Stem: superseded, previous.Stem: previous, failed.Stem: failed, skipped.Stem: skipped}
+	if err := renderSummary(&buf, rows, nil); err != nil {
+		t.Fatal(err)
+	}
+	html := buf.String()
+
+	if strings.Contains(html, "app_old.html") {
+		t.Error("previous row superseded by a current row with the same label must be hidden")
+	}
+	order := []string{"alpine:no-such-tag", "broken.tar", "app:1.0", "redis:7"}
+	last := -1
+	for _, label := range order {
+		i := strings.Index(html, `class="package-name">`+label)
+		if i < 0 || i < last {
+			t.Fatalf("row order wrong at %q, want %v", label, order)
+		}
+		last = i
+	}
+	for _, want := range []string{"Failed</span>", "Skipped</span>", "Previous run</span>", "row-previous", "MANIFEST_UNKNOWN: &lt;manifest&gt; unknown details", `<div class="card-label">Failed</div>`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("summary missing %q", want)
+		}
+	}
+	if !strings.Contains(skipped.Error, "…") || len([]rune(skipped.Error)) != maxRowError+1 {
+		t.Errorf("long error not truncated on a rune boundary: %d runes", len([]rune(skipped.Error)))
+	}
+	// totals ignore the hidden superseded row (5 CRITICAL)
+	if !strings.Contains(html, `<div class="card-value">1</div>`) || strings.Contains(html, `<div class="card-value">6</div>`) {
+		t.Error("totals should only count visible rows")
+	}
+}
+
+func TestHashCache(t *testing.T) {
+	dir := t.TempDir()
+	tar := filepath.Join(dir, "a.tar")
+	if err := os.WriteFile(tar, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(dir, hashCacheFile)
+	ctx := context.Background()
+
+	c := loadHashCache(cachePath)
+	h, err := c.hash(ctx, tar, false)
+	if err != nil || h != "ed7002" {
+		t.Fatalf("hash = %q, %v", h, err)
+	}
+	if err := c.save(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same size and mtime: the cached value is used even though content changed.
+	info, _ := os.Stat(tar)
+	if err := os.WriteFile(tar, []byte("CONTENT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(tar, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	c = loadHashCache(cachePath)
+	if h, _ := c.hash(ctx, tar, false); h != "ed7002" {
+		t.Errorf("expected cache hit, got %q", h)
+	}
+	if h, _ := c.hash(ctx, tar, true); h == "ed7002" {
+		t.Error("force must rehash")
+	}
+
+	// A different mtime invalidates the entry.
+	if err := os.Chtimes(tar, time.Now().Add(time.Hour), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c = loadHashCache(cachePath)
+	if h, _ := c.hash(ctx, tar, false); h == "ed7002" {
+		t.Error("changed mtime must rehash")
+	}
+
+	// save drops missing files and, with keep, everything not kept.
+	c.entries["/does/not/exist.tar"] = hashEntry{Hash: "x"}
+	if err := c.save(map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.entries) != 0 {
+		t.Errorf("entries after save(keep={}) = %v", c.entries)
+	}
+
+	if err := os.WriteFile(cachePath, []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c := loadHashCache(cachePath); len(c.entries) != 0 {
+		t.Error("corrupt cache should load empty")
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := fileHash(cancelled, tar); !errors.Is(err, context.Canceled) {
+		t.Errorf("fileHash with cancelled ctx = %v, want context.Canceled", err)
+	}
+}
+
+func TestPruneReports(t *testing.T) {
+	out := t.TempDir()
+	files := map[string]bool{ // path → should survive
+		"json/keep_1.json":      true,
+		"json/old_2.json":       false,
+		"json/keep_1.json.tmp":  false,
+		"json/" + hashCacheFile: true,
+		"json/notes.txt":        true,
+		"html/keep_1.html":      true,
+		"html/old_2.html":       false,
+		"summary.html":          true,
+		"other/old_2.json":      true,
+	}
+	for f := range files {
+		p := filepath.Join(out, f)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneReports(out, map[string]bool{"keep_1": true})
+	for f, survive := range files {
+		_, err := os.Stat(filepath.Join(out, f))
+		if exists := err == nil; exists != survive {
+			t.Errorf("%s exists=%v, want %v", f, exists, survive)
+		}
+	}
+}
+
+func TestResolveInputsDedupesPaths(t *testing.T) {
+	dir := t.TempDir()
+	tar := filepath.Join(dir, "a.tar")
+	if err := os.WriteFile(tar, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(wd) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := resolveInputs([]string{"a.tar", "./a.tar", tar}, defaultMaxDepth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 {
+		t.Errorf("targets = %v, want one", targets)
+	}
+}
+
+func TestReadTargetListRelativeToFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "img.tar"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	list := filepath.Join(dir, "images.txt")
+	if err := os.WriteFile(list, []byte("img.tar\nnginx:latest\nmissing.tar\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readTargetList(list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(dir, "img.tar"), "nginx:latest", "missing.tar"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("readTargetList = %q, want %q", got, want)
+	}
+}
+
+func TestVersionLess(t *testing.T) {
+	for _, tt := range []struct {
+		a, b string
+		want bool
+	}{
+		{"0.69.3", "0.70.0", true},
+		{"0.70.0", "0.70.0", false},
+		{"0.76.2", "0.70.0", false},
+		{"1.0.0", "0.70.0", false},
+	} {
+		if got := versionLess(tt.a, tt.b); got != tt.want {
+			t.Errorf("versionLess(%s, %s) = %v", tt.a, tt.b, got)
+		}
+	}
+	if m := trivyVersionRe.FindStringSubmatch("Version: 0.76.2\nVulnerability DB:\n  Version: 2"); m == nil || m[1] != "0.76.2" {
+		t.Errorf("trivyVersionRe = %v", m)
 	}
 }
