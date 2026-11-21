@@ -6,7 +6,7 @@ A container image vulnerability scanner built on Trivy, with professional HTML r
 
 - 📁 **Batch Scanning** - Scan a whole directory of `.tar`/`.tar.gz`/`.tgz` images in one command
 - 📊 **Beautiful Reports** - Sentra-inspired interactive HTML report per image
-- 📋 **Summary Page** - One `summary.html` with severity counts for every image
+- 📋 **Summary Page** - One `html/summary.html` with severity counts for every image
 - 🗂️ **JSON First** - Raw Trivy JSON kept for every image; HTML is rendered from it
 - ⚡ **Incremental** - Unchanged images are not rescanned until the Trivy DB changes
 - 🔄 **Auto Updates** - Automatic vulnerability database updates
@@ -59,7 +59,7 @@ trivyscan -i nginx:latest,redis:7,ghcr.io/org/app:dev -o ./reports
 # Scan images listed in a file (one per line, # comments allowed)
 trivyscan -l images.txt -o ./reports
 
-# Scan folder (all .tar/.tar.gz/.tgz files) → per-image reports + summary.html
+# Scan folder (all .tar/.tar.gz/.tgz files) → per-image reports + html/summary.html
 trivyscan -i ./images -o ./reports
 
 # Show only critical/high (re-renders from JSON, no rescan)
@@ -78,7 +78,7 @@ trivyscan [flags]
 |------|-------|-------------|---------|
 | `--input` | `-i` | Image references, `.tar`/`.tar.gz`/`.tgz` files or directories; comma-separated or repeated (use `-l` for paths containing commas) | *required* (or `-l`) |
 | `--list` | `-l` | File with one input per line (`#` comments allowed); relative paths are resolved next to the list file | |
-| `--output` | `-o` | Output directory (`json/`, `html/`, `summary.html`) | `.` |
+| `--output` | `-o` | Output directory (`json/`, `html/` with `summary.html`) | `.` |
 | `--severity` | `-s` | Severity levels shown in reports (render-time filter); unknown names are an error | all |
 | `--scanner` | `-S` | Trivy scanners (`vuln,misconfig,secret,license`) | Trivy default |
 | `--force` | `-f` | Rescan (and re-hash) even if an up-to-date JSON report exists | `false` |
@@ -158,12 +158,12 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
 
 ```
 ./reports/
-├── summary.html                  # all images: OS, severity counts, link to detail page
 ├── json/
 │   ├── .hashes.json              # cache of tar hashes (path, size, mtime)
 │   ├── nginx_a3f9c2.json         # full Trivy JSON (all severities)
 │   └── api-server_7b8d1e.json
 └── html/
+    ├── summary.html              # all images: OS, severity counts, link to detail page
     ├── nginx_a3f9c2.html         # detail report
     └── api-server_7b8d1e.html
 ```
@@ -174,7 +174,7 @@ Each image is scanned once by Trivy into JSON; the HTML pages are rendered from 
 - On the next run, a tar whose JSON is newer than the Trivy DB is not rescanned, only re-rendered.
   Its hash is cached by size and modification time, so unchanged tars are not even re-read.
   Changing `-s` is therefore instant. Use `--force` to rescan and re-hash anyway (e.g. after changing `-S`).
-- `summary.html` shows a status for every target: **OK**, **Failed** (with the reason), **Skipped** (invalid tar),
+- `html/summary.html` shows a status for every target: **OK**, **Failed** (with the reason), **Skipped** (invalid tar),
   and **Previous run** for reports from earlier runs still in `json/`. A previous-run report is hidden when an image
   with the same name was scanned in this run (e.g. an older export of the same tar).
 - `--prune` deletes `json/` and `html/` reports that are not part of the current run (never when the run was cancelled).

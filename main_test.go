@@ -119,7 +119,7 @@ func TestSummary(t *testing.T) {
 	if row.Label != "app:1.0" || row.OS != "alpine 3.19.1" || row.Digest != "0123456789ab" {
 		t.Errorf("Label=%q OS=%q Digest=%q", row.Label, row.OS, row.Digest)
 	}
-	if row.Href != "html/app_abc123.html" {
+	if row.Href != "app_abc123.html" {
 		t.Errorf("Href = %q", row.Href)
 	}
 
@@ -149,7 +149,7 @@ func TestSummary(t *testing.T) {
 	if i, j := strings.Index(html, "app:1.0"), strings.Index(html, "clean.tar"); i < 0 || j < 0 || i > j {
 		t.Error("rows not sorted by severity (app:1.0 should come before clean.tar)")
 	}
-	for _, want := range []string{`href="html/app_abc123.html"`, `href="html/clean_def456.html"`, `class="severity-CRITICAL"`, ">Unknown</th>"} {
+	for _, want := range []string{`href="app_abc123.html"`, `href="clean_def456.html"`, `class="severity-CRITICAL"`, ">Unknown</th>"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("summary missing %s", want)
 		}
@@ -264,6 +264,26 @@ func TestErrorClassification(t *testing.T) {
 	} {
 		if isRetryableError(errors.New("trivy failed: exit status 1: " + msg + " connection i/o timeout")) {
 			t.Errorf("registry rejection must not be retried: %s", msg)
+		}
+	}
+}
+
+func TestIsDockerDigestError(t *testing.T) {
+	real := errors.New(`trivy failed: exit status 1: FATAL Fatal error run error: image scan error: ` +
+		`unable to export the image: Error response from daemon: unable to create manifests file: ` +
+		`NotFound: content digest sha256:6cbaee6f841f2230bcf06a4d2c52d00aef82fd36db93b70ca54cc980470736b3: not found`)
+	if !isDockerDigestError(real) {
+		t.Error("daemon digest error not recognised")
+	}
+	if isRetryableError(real) {
+		t.Error("daemon digest error must not be retried")
+	}
+	for _, msg := range []string{
+		`trivy failed: MANIFEST_UNKNOWN: manifest unknown`,
+		`trivy failed: connection reset by peer`,
+	} {
+		if isDockerDigestError(errors.New(msg)) {
+			t.Errorf("not a daemon digest error: %s", msg)
 		}
 	}
 }
@@ -488,7 +508,7 @@ func TestPruneReports(t *testing.T) {
 		"json/notes.txt":        true,
 		"html/keep_1.html":      true,
 		"html/old_2.html":       false,
-		"summary.html":          true,
+		"html/summary.html":     true,
 		"other/old_2.json":      true,
 	}
 	for f := range files {

@@ -132,7 +132,7 @@ trivyscan -i image.tar -o reports/
 # Scan image references (comma-separated, repeated -i, or a list file with -l)
 trivyscan -i nginx:latest,redis:7 -o reports/
 
-# Scan a directory of tar files → reports/json/, reports/html/, reports/summary.html
+# Scan a directory of tar files → reports/json/, reports/html/ (with summary.html)
 trivyscan -i ./images/ -o reports/
 
 # Custom severity (render-time filter, no rescan needed)

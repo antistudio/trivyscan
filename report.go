@@ -251,7 +251,7 @@ func summarize(stem, jsonPath string, rep *trivyReport, sev severitySet) summary
 		Stem:   stem,
 		Label:  stem,
 		OS:     "-",
-		Href:   htmlSubdir + "/" + stem + ".html",
+		Href:   stem + ".html",
 		Counts: map[string]int{},
 		Status: statusOK,
 	}

@@ -48,7 +48,7 @@ const (
 	minTrivyVersion     = "0.70.0"
 )
 
-// Output layout: <out>/json/<stem>.json, <out>/html/<stem>.html, <out>/summary.html
+// Output layout: <out>/json/<stem>.json, <out>/html/<stem>.html, <out>/html/summary.html
 const (
 	jsonSubdir    = "json"
 	htmlSubdir    = "html"
@@ -155,9 +155,20 @@ func isImageNotFoundError(err error) bool {
 	return false
 }
 
+// isDockerDigestError returns true when the Docker daemon knows the tag but
+// cannot export it because a manifest digest is missing from its store.
+func isDockerDigestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "unable to create manifests file") ||
+		(strings.Contains(s, "content digest") && strings.Contains(s, "not found"))
+}
+
 // isRetryableError returns true for transient infrastructure errors.
 func isRetryableError(err error) bool {
-	if err == nil || isInvalidImageError(err) || isImageNotFoundError(err) || errors.Is(err, errScanTimeout) {
+	if err == nil || isInvalidImageError(err) || isImageNotFoundError(err) || isDockerDigestError(err) || errors.Is(err, errScanTimeout) {
 		return false
 	}
 	s := strings.ToLower(err.Error())
@@ -256,6 +267,10 @@ func processScan(ctx context.Context, target scanTarget, jsonPath, scanner strin
 		trivySkipDB, trivySkipJavaDB,
 	}
 
+	if scanner != "" {
+		args = append(args, "--scanners", scanner)
+	}
+
 	switch target.Kind {
 	case inputTypeTar:
 		if _, err := os.Stat(target.Input); os.IsNotExist(err) {
@@ -267,10 +282,27 @@ func processScan(ctx context.Context, target scanTarget, jsonPath, scanner strin
 		args = append(args, target.Input)
 	}
 
-	if scanner != "" {
-		args = append(args, "--scanners", scanner)
+	err := runTrivy(scanCtx, args, tmpFile, jsonPath, timeout)
+	if err == nil || target.Kind != inputTypeImage || !isDockerDigestError(err) {
+		return err
 	}
 
+	// The daemon lists the tag but cannot export it (manifest digest missing
+	// from its store). trivy exports by name, so point it at a tag that
+	// resolves to the image ID instead.
+	log.Warn().Str("input", target.Input).Msg("Docker cannot export the image by tag, retrying by image ID")
+	tmpTag, cleanup, tagErr := tagImageByID(scanCtx, target.Input)
+	if tagErr != nil {
+		log.Debug().Err(tagErr).Msg("Cannot retag image")
+		return fmt.Errorf("%w (hint: docker image store may be corrupt, run: docker pull %s)", err, target.Input)
+	}
+	defer cleanup()
+
+	return runTrivy(scanCtx, append(args[:len(args)-1], tmpTag), tmpFile, jsonPath, timeout)
+}
+
+// runTrivy executes trivy and publishes the report atomically on success.
+func runTrivy(scanCtx context.Context, args []string, tmpFile, jsonPath string, timeout time.Duration) error {
 	output, err := exec.CommandContext(scanCtx, trivyCmd, args...).CombinedOutput()
 	if err != nil {
 		msg := trivyErrorMessage(output)
@@ -280,6 +312,36 @@ func processScan(ctx context.Context, target scanTarget, jsonPath, scanner strin
 		return fmt.Errorf("trivy failed: %w: %s", err, msg)
 	}
 	return os.Rename(tmpFile, jsonPath)
+}
+
+// tagImageByID resolves ref to its local image ID and tags that ID under a
+// temporary name, so the daemon exports the image rather than a broken
+// manifest-list digest. cleanup removes the temporary tag.
+func tagImageByID(ctx context.Context, ref string) (string, func(), error) {
+	noop := func() {}
+
+	out, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", ref).CombinedOutput()
+	if err != nil {
+		return "", noop, fmt.Errorf("docker image inspect %s: %w: %s", ref, err, strings.TrimSpace(string(out)))
+	}
+	id := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(id, "sha256:") {
+		return "", noop, fmt.Errorf("docker image inspect %s: unexpected image ID %q", ref, id)
+	}
+
+	sum := sha256.Sum256([]byte(ref))
+	tag := fmt.Sprintf("trivyscan-tmp:%s-%d", hex.EncodeToString(sum[:])[:hashLength], os.Getpid())
+
+	if out, err := exec.CommandContext(ctx, "docker", "tag", id, tag).CombinedOutput(); err != nil {
+		return "", noop, fmt.Errorf("docker tag %s: %w: %s", id, err, strings.TrimSpace(string(out)))
+	}
+
+	cleanup := func() {
+		if out, err := exec.Command("docker", "rmi", tag).CombinedOutput(); err != nil {
+			log.Warn().Str("tag", tag).Msgf("Cannot remove temporary tag: %s", strings.TrimSpace(string(out)))
+		}
+	}
+	return tag, cleanup, nil
 }
 
 // trivyErrorMessage trims trivy output to the FATAL message, so error
@@ -779,7 +841,7 @@ func pruneReports(outputDir string, keep map[string]bool) {
 		}
 		for _, e := range entries {
 			name := e.Name()
-			if e.IsDir() || strings.HasPrefix(name, ".") {
+			if e.IsDir() || strings.HasPrefix(name, ".") || (dir.name == htmlSubdir && name == summaryFile) {
 				continue
 			}
 			stale := strings.HasSuffix(name, ".tmp")
@@ -811,7 +873,7 @@ func run() int {
 		flagSet.StringVarP(&opts.ListFile, "list", "l", "", "file with one input per line (# comments allowed)"),
 	)
 	flagSet.CreateGroup("output", "Output",
-		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory (json/, html/, summary.html)"),
+		flagSet.StringVarP(&opts.Output, "output", "o", ".", "output directory (json/, html/ with summary.html)"),
 	)
 	flagSet.CreateGroup("configs", "Configs",
 		flagSet.StringVarP(&opts.Severity, "severity", "s", "", "severity levels to show in reports (default all)"),
@@ -957,7 +1019,7 @@ func run() int {
 	}
 
 	rows := map[string]summaryRow{}
-	summaryPath := filepath.Join(opts.Output, summaryFile)
+	summaryPath := filepath.Join(opts.Output, htmlSubdir, summaryFile)
 	summaryFailed := false
 	writeSummary := func() {
 		if err := writeFileAtomic(summaryPath, func(w io.Writer) error { return renderSummary(w, rows, sev) }); err != nil {
