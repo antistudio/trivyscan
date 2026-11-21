@@ -27,10 +27,9 @@ var summaryTemplateContent string
 // detail template can use both .Severity and .Vulnerability.Severity, exactly
 // like trivy's own types.
 type Vulnerability struct {
-	Title       string
-	Description string
-	Severity    string
-	References  []string
+	Title      string
+	Severity   string
+	References []string
 }
 
 type detectedVuln struct {
@@ -55,7 +54,6 @@ type misconfiguration struct {
 
 type result struct {
 	Target            string
-	Class             string
 	Type              string
 	Vulnerabilities   []detectedVuln
 	Misconfigurations []misconfiguration
@@ -145,38 +143,55 @@ func filterResults(results []result, sev severitySet) []result {
 	out := make([]result, 0, len(results))
 	for _, r := range results {
 		fr := r
-		fr.Vulnerabilities = nil
-		seen := map[[4]string]bool{}
-		for _, v := range r.Vulnerabilities {
-			key := [4]string{v.VulnerabilityID, v.PkgName, v.InstalledVersion, v.PkgPath}
-			if sev.has(v.Severity) && !seen[key] {
-				seen[key] = true
-				fr.Vulnerabilities = append(fr.Vulnerabilities, v)
-			}
-		}
-		sort.SliceStable(fr.Vulnerabilities, func(i, j int) bool {
-			a, b := fr.Vulnerabilities[i], fr.Vulnerabilities[j]
-			if a.PkgName != b.PkgName {
-				return a.PkgName < b.PkgName
-			}
-			if a.InstalledVersion != b.InstalledVersion {
-				return a.InstalledVersion < b.InstalledVersion
-			}
-			if ra, rb := severityRank[strings.ToUpper(a.Severity)], severityRank[strings.ToUpper(b.Severity)]; ra != rb {
-				return ra > rb
-			}
-			if a.VulnerabilityID != b.VulnerabilityID {
-				return a.VulnerabilityID < b.VulnerabilityID
-			}
-			return a.PkgPath < b.PkgPath
-		})
-		fr.Misconfigurations = nil
-		for _, m := range r.Misconfigurations {
-			if m.Status == "FAIL" && sev.has(m.Severity) {
-				fr.Misconfigurations = append(fr.Misconfigurations, m)
-			}
-		}
+		fr.Vulnerabilities = filterVulnerabilities(r.Vulnerabilities, sev)
+		fr.Misconfigurations = filterMisconfigurations(r.Misconfigurations, sev)
 		out = append(out, fr)
+	}
+	return out
+}
+
+// filterVulnerabilities keeps severities inside sev, dedupes by package and
+// sorts in trivy's display order.
+func filterVulnerabilities(vulns []detectedVuln, sev severitySet) []detectedVuln {
+	var out []detectedVuln
+	seen := map[[4]string]bool{}
+	for _, v := range vulns {
+		key := [4]string{v.VulnerabilityID, v.PkgName, v.InstalledVersion, v.PkgPath}
+		if sev.has(v.Severity) && !seen[key] {
+			seen[key] = true
+			out = append(out, v)
+		}
+	}
+	sortVulnerabilities(out)
+	return out
+}
+
+func sortVulnerabilities(vulns []detectedVuln) {
+	sort.SliceStable(vulns, func(i, j int) bool {
+		a, b := vulns[i], vulns[j]
+		if a.PkgName != b.PkgName {
+			return a.PkgName < b.PkgName
+		}
+		if a.InstalledVersion != b.InstalledVersion {
+			return a.InstalledVersion < b.InstalledVersion
+		}
+		if ra, rb := severityRank[strings.ToUpper(a.Severity)], severityRank[strings.ToUpper(b.Severity)]; ra != rb {
+			return ra > rb
+		}
+		if a.VulnerabilityID != b.VulnerabilityID {
+			return a.VulnerabilityID < b.VulnerabilityID
+		}
+		return a.PkgPath < b.PkgPath
+	})
+}
+
+// filterMisconfigurations keeps only failed checks inside sev.
+func filterMisconfigurations(ms []misconfiguration, sev severitySet) []misconfiguration {
+	var out []misconfiguration
+	for _, m := range ms {
+		if m.Status == "FAIL" && sev.has(m.Severity) {
+			out = append(out, m)
+		}
 	}
 	return out
 }
@@ -272,26 +287,46 @@ func summarize(stem, jsonPath string, rep *trivyReport, sev severitySet) summary
 	}
 
 	// Count what the detail page shows, so both pages always agree.
+	row.Counts, row.Total = countSeverities(rep, sev)
+	row.Highest = highestSeverity(row.Counts)
+	row.Worst = worstSeverity(rep)
+	return row
+}
+
+// countSeverities counts the vulnerabilities the detail page shows for sev.
+func countSeverities(rep *trivyReport, sev severitySet) (counts map[string]int, total int) {
+	counts = map[string]int{}
 	for _, r := range filterResults(rep.Results, sev) {
 		for _, v := range r.Vulnerabilities {
-			row.Counts[strings.ToUpper(v.Severity)]++
-			row.Total++
+			counts[strings.ToUpper(v.Severity)]++
+			total++
 		}
 	}
+	return counts, total
+}
+
+// highestSeverity returns the highest severity with a non-zero count.
+func highestSeverity(counts map[string]int) string {
 	for _, s := range summarySeverities {
-		if row.Counts[s] > 0 {
-			row.Highest = s
-			break
+		if counts[s] > 0 {
+			return s
 		}
 	}
-	for _, r := range filterResults(rep.Results, nil) {
+	return ""
+}
+
+// worstSeverity returns the highest severity in the report, ignoring -s
+// (used by --fail-on); dedupe and sort do not affect a max.
+func worstSeverity(rep *trivyReport) string {
+	worst := ""
+	for _, r := range rep.Results {
 		for _, v := range r.Vulnerabilities {
-			if s := strings.ToUpper(v.Severity); row.Worst == "" || severityRank[s] > severityRank[row.Worst] {
-				row.Worst = s
+			if s := strings.ToUpper(v.Severity); worst == "" || severityRank[s] > severityRank[worst] {
+				worst = s
 			}
 		}
 	}
-	return row
+	return worst
 }
 
 type summaryData struct {
@@ -324,6 +359,14 @@ func detailCSS() htmltemplate.CSS {
 }
 
 func renderSummary(w io.Writer, rows map[string]summaryRow, sev severitySet) error {
+	data := buildSummary(rows, sev)
+	sortSummaryRows(data.Rows)
+	return summaryTmpl.Execute(w, data)
+}
+
+// buildSummary aggregates rows into the summary page data, hiding previous-run
+// rows superseded by a row of this run.
+func buildSummary(rows map[string]summaryRow, sev severitySet) summaryData {
 	data := summaryData{
 		CSS:       detailCSS(),
 		Generated: time.Now().Format("2006-01-02 15:04"),
@@ -355,8 +398,14 @@ func renderSummary(w io.Writer, rows map[string]summaryRow, sev severitySet) err
 			data.Failed++
 		}
 	}
-	sort.Slice(data.Rows, func(i, j int) bool {
-		a, b := data.Rows[i], data.Rows[j]
+	return data
+}
+
+// sortSummaryRows puts failures first, then earlier runs last, ordering equal
+// statuses by severity counts and label.
+func sortSummaryRows(rows []summaryRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
 		if statusRank[a.Status] != statusRank[b.Status] {
 			return statusRank[a.Status] < statusRank[b.Status]
 		}
@@ -374,7 +423,11 @@ func renderSummary(w io.Writer, rows map[string]summaryRow, sev severitySet) err
 		}
 		return a.Stem < b.Stem
 	})
-	return summaryTmpl.Execute(w, data)
+}
+
+// writeSummaryFile renders the summary page atomically.
+func writeSummaryFile(path string, rows map[string]summaryRow, sev severitySet) error {
+	return writeFileAtomic(path, func(w io.Writer) error { return renderSummary(w, rows, sev) })
 }
 
 // ---------------------------------------------------------------------------

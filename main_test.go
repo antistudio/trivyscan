@@ -243,7 +243,7 @@ func TestIsReportFresh(t *testing.T) {
 }
 
 func TestErrorClassification(t *testing.T) {
-	out := []byte("2026-11-14T14:38:13+07:00\tFATAL\tFatal error\trun error: context deadline exceeded")
+	out := "2026-11-14T14:38:13+07:00\tFATAL\tFatal error\trun error: context deadline exceeded"
 	if msg := trivyErrorMessage(out); !strings.HasPrefix(msg, "FATAL") {
 		t.Errorf("trivyErrorMessage = %q", msg)
 	}
@@ -284,6 +284,35 @@ func TestIsDockerDigestError(t *testing.T) {
 	} {
 		if isDockerDigestError(errors.New(msg)) {
 			t.Errorf("not a daemon digest error: %s", msg)
+		}
+	}
+}
+
+func TestScanExitCode(t *testing.T) {
+	success := []scanResult{
+		{Target: scanTarget{Input: "a", Stem: "a_1"}},
+		{Target: scanTarget{Input: "b", Stem: "b_1"}},
+	}
+	rows := map[string]summaryRow{
+		"a_1": {Stem: "a_1", Worst: "CRITICAL"},
+		"b_1": {Stem: "b_1", Worst: "LOW"},
+	}
+	tests := []struct {
+		name          string
+		failOn        string
+		failed        []scanResult
+		summaryFailed bool
+		want          int
+	}{
+		{"clean", "", nil, false, 0},
+		{"threshold hit", "HIGH", nil, false, 2},
+		{"summary failure wins over threshold", "HIGH", nil, true, 1},
+		{"scan failure", "", []scanResult{{}}, false, 1},
+		{"summary failure", "", nil, true, 1},
+	}
+	for _, tt := range tests {
+		if got := scanExitCode(tt.failOn, success, tt.failed, rows, tt.summaryFailed); got != tt.want {
+			t.Errorf("%s: scanExitCode = %d, want %d", tt.name, got, tt.want)
 		}
 	}
 }

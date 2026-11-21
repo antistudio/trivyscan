@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,7 +103,6 @@ type scanTarget struct {
 
 type scanResult struct {
 	Target   scanTarget
-	JSONFile string
 	HTMLFile string
 	Error    error
 	Duration time.Duration
@@ -117,23 +117,28 @@ type scanResult struct {
 // errScanTimeout marks a scan that hit the timeout. Retrying would only hit it again.
 var errScanTimeout = errors.New("scan timeout")
 
+// containsAny reports whether s contains at least one of subs.
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // isInvalidImageError returns true when the tar is not a valid Docker/OCI image.
 // These errors should be skipped, not retried.
 func isInvalidImageError(err error) bool {
 	if err == nil {
 		return false
 	}
-	for _, p := range []string{
+	return containsAny(err.Error(),
 		"manifest.json not found",
 		"index.json: not a directory",
 		"unable to initialize archive image",
 		"unable to open",
-	} {
-		if strings.Contains(err.Error(), p) {
-			return true
-		}
-	}
-	return false
+	)
 }
 
 // isImageNotFoundError returns true when the registry definitively rejected an
@@ -142,17 +147,7 @@ func isImageNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	for _, p := range []string{
-		"MANIFEST_UNKNOWN",
-		"NAME_UNKNOWN",
-		"UNAUTHORIZED",
-		"DENIED",
-	} {
-		if strings.Contains(err.Error(), p) {
-			return true
-		}
-	}
-	return false
+	return containsAny(err.Error(), "MANIFEST_UNKNOWN", "NAME_UNKNOWN", "UNAUTHORIZED", "DENIED")
 }
 
 // isDockerDigestError returns true when the Docker daemon knows the tag but
@@ -162,8 +157,8 @@ func isDockerDigestError(err error) bool {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "unable to create manifests file") ||
-		(strings.Contains(s, "content digest") && strings.Contains(s, "not found"))
+	return containsAny(s, "unable to create manifests file") ||
+		(containsAny(s, "content digest") && containsAny(s, "not found"))
 }
 
 // isRetryableError returns true for transient infrastructure errors.
@@ -171,20 +166,14 @@ func isRetryableError(err error) bool {
 	if err == nil || isInvalidImageError(err) || isImageNotFoundError(err) || isDockerDigestError(err) || errors.Is(err, errScanTimeout) {
 		return false
 	}
-	s := strings.ToLower(err.Error())
-	for _, p := range []string{
+	return containsAny(strings.ToLower(err.Error()),
 		"timeout", "i/o timeout", "context deadline exceeded",
 		"connection refused", "connection reset", "no such host",
 		"temporary failure", "network", "connection",
 		"database is locked", "database locked",
 		"sqlite_busy", "sqlite_locked",
 		"cache may be in use",
-	} {
-		if strings.Contains(s, p) {
-			return true
-		}
-	}
-	return false
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +194,7 @@ func scanOne(ctx context.Context, target scanTarget, jsonPath, scanner string, t
 
 		err := processScan(ctx, target, jsonPath, scanner, timeout)
 		if err == nil {
-			return scanResult{Target: target, JSONFile: jsonPath, Duration: time.Since(start)}
+			return scanResult{Target: target, Duration: time.Since(start)}
 		}
 		// trivy was killed because the run was cancelled, not because the scan failed
 		if ctx.Err() != nil {
@@ -271,18 +260,19 @@ func processScan(ctx context.Context, target scanTarget, jsonPath, scanner strin
 		args = append(args, "--scanners", scanner)
 	}
 
+	var source []string
 	switch target.Kind {
 	case inputTypeTar:
 		if _, err := os.Stat(target.Input); os.IsNotExist(err) {
 			return fmt.Errorf("file not found: %s", target.Input)
 		}
-		args = append(args, "--input", target.Input)
+		source = []string{"--input", target.Input}
 	case inputTypeImage:
 		// image reference is positional arg, no --input flag
-		args = append(args, target.Input)
+		source = []string{target.Input}
 	}
 
-	err := runTrivy(scanCtx, args, tmpFile, jsonPath, timeout)
+	err := runTrivy(scanCtx, slices.Concat(args, source), tmpFile, jsonPath, timeout)
 	if err == nil || target.Kind != inputTypeImage || !isDockerDigestError(err) {
 		return err
 	}
@@ -298,14 +288,14 @@ func processScan(ctx context.Context, target scanTarget, jsonPath, scanner strin
 	}
 	defer cleanup()
 
-	return runTrivy(scanCtx, append(args[:len(args)-1], tmpTag), tmpFile, jsonPath, timeout)
+	return runTrivy(scanCtx, slices.Concat(args, []string{tmpTag}), tmpFile, jsonPath, timeout)
 }
 
 // runTrivy executes trivy and publishes the report atomically on success.
 func runTrivy(scanCtx context.Context, args []string, tmpFile, jsonPath string, timeout time.Duration) error {
-	output, err := exec.CommandContext(scanCtx, trivyCmd, args...).CombinedOutput()
+	out, err := runCommand(scanCtx, trivyCmd, args...)
 	if err != nil {
-		msg := trivyErrorMessage(output)
+		msg := trivyErrorMessage(out)
 		if scanCtx.Err() == context.DeadlineExceeded || strings.Contains(msg, "context deadline exceeded") {
 			return fmt.Errorf("%w after %s: %s", errScanTimeout, timeout, msg)
 		}
@@ -320,11 +310,10 @@ func runTrivy(scanCtx context.Context, args []string, tmpFile, jsonPath string, 
 func tagImageByID(ctx context.Context, ref string) (string, func(), error) {
 	noop := func() {}
 
-	out, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", ref).CombinedOutput()
+	id, err := runCommand(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", ref)
 	if err != nil {
-		return "", noop, fmt.Errorf("docker image inspect %s: %w: %s", ref, err, strings.TrimSpace(string(out)))
+		return "", noop, fmt.Errorf("docker image inspect %s: %w: %s", ref, err, id)
 	}
-	id := strings.TrimSpace(string(out))
 	if !strings.HasPrefix(id, "sha256:") {
 		return "", noop, fmt.Errorf("docker image inspect %s: unexpected image ID %q", ref, id)
 	}
@@ -332,13 +321,13 @@ func tagImageByID(ctx context.Context, ref string) (string, func(), error) {
 	sum := sha256.Sum256([]byte(ref))
 	tag := fmt.Sprintf("trivyscan-tmp:%s-%d", hex.EncodeToString(sum[:])[:hashLength], os.Getpid())
 
-	if out, err := exec.CommandContext(ctx, "docker", "tag", id, tag).CombinedOutput(); err != nil {
-		return "", noop, fmt.Errorf("docker tag %s: %w: %s", id, err, strings.TrimSpace(string(out)))
+	if out, err := runCommand(ctx, "docker", "tag", id, tag); err != nil {
+		return "", noop, fmt.Errorf("docker tag %s: %w: %s", id, err, out)
 	}
 
 	cleanup := func() {
-		if out, err := exec.Command("docker", "rmi", tag).CombinedOutput(); err != nil {
-			log.Warn().Str("tag", tag).Msgf("Cannot remove temporary tag: %s", strings.TrimSpace(string(out)))
+		if out, err := runCommand(context.Background(), "docker", "rmi", tag); err != nil {
+			log.Warn().Str("tag", tag).Msgf("Cannot remove temporary tag: %s", out)
 		}
 	}
 	return tag, cleanup, nil
@@ -346,8 +335,7 @@ func tagImageByID(ctx context.Context, ref string) (string, func(), error) {
 
 // trivyErrorMessage trims trivy output to the FATAL message, so error
 // classification does not match words from unrelated log lines.
-func trivyErrorMessage(output []byte) string {
-	s := strings.TrimSpace(string(output))
+func trivyErrorMessage(s string) string {
 	if i := strings.Index(s, "FATAL"); i >= 0 {
 		s = s[i:]
 	}
@@ -371,12 +359,12 @@ func (t scanTarget) kindString() string {
 
 func checkTrivyInstalled(ctx context.Context) error {
 	log.Info().Msg("Checking Trivy...")
-	output, err := exec.CommandContext(ctx, trivyCmd, "--version").CombinedOutput()
+	output, err := runCommand(ctx, trivyCmd, "--version")
 	if err != nil {
 		return buildTrivyNotFoundError()
 	}
-	log.Info().Msgf("Trivy: %s", strings.TrimSpace(string(output)))
-	if v := trivyVersionRe.FindStringSubmatch(string(output)); v != nil && versionLess(v[1], minTrivyVersion) {
+	log.Info().Msgf("Trivy: %s", output)
+	if v := trivyVersionRe.FindStringSubmatch(output); v != nil && versionLess(v[1], minTrivyVersion) {
 		log.Warn().Str("version", v[1]).Str("minimum", minTrivyVersion).Msg("Trivy is older than the tested minimum, results may differ")
 	}
 	return nil
@@ -422,7 +410,7 @@ func updateTrivyDB(ctx context.Context) error {
 		default:
 		}
 		log.Info().Str("database", db.name).Msg("Downloading...")
-		output, err := exec.CommandContext(ctx, trivyCmd, trivySubCmd, db.flag).CombinedOutput()
+		output, err := runCommand(ctx, trivyCmd, trivySubCmd, db.flag)
 		if err != nil {
 			log.Error().Str("database", db.name).Msgf("Update failed: %s", output)
 			return fmt.Errorf("%s db failed: %w", db.name, err)
@@ -644,6 +632,12 @@ func isImageReference(s string) bool {
 // Utilities
 // ---------------------------------------------------------------------------
 
+// runCommand runs name with args and returns trimmed combined output.
+func runCommand(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
 func calculateBackoff(attempt int) time.Duration {
 	b := float64(defaultInitialBackoff) * math.Pow(defaultBackoffMultiplier, float64(attempt))
 	if b > float64(defaultMaxBackoff) {
@@ -861,9 +855,9 @@ func pruneReports(outputDir string, keep map[string]bool) {
 	}
 }
 
-// run contains all application logic and returns an exit code.
-// Using a separate function keeps main clean and ensures defers always execute.
-func run() int {
+// loadOptions parses flags and validates them. A non-negative code means the
+// program should exit immediately; otherwise (-1) a scan should proceed.
+func loadOptions() (options, severitySet, string, int) {
 	opts := options{}
 
 	flagSet := goflags.NewFlagSet()
@@ -898,41 +892,39 @@ func run() int {
 
 	if opts.Version {
 		fmt.Printf("TrivyScan version %s\n", version)
-		return 0
+		return opts, nil, "", 0
 	}
 
 	sev, err := parseSeverity(opts.Severity)
 	if err != nil {
 		log.Error().Err(err).Msg("Invalid --severity")
-		return 1
+		return opts, nil, "", 1
 	}
 	failOn := strings.ToUpper(strings.TrimSpace(opts.FailOn))
 	if failOn != "" && !isSeverity(failOn) {
 		log.Error().Str("fail_on", opts.FailOn).Strs("valid", summarySeverities).Msg("Invalid --fail-on")
-		return 1
+		return opts, nil, "", 1
 	}
+	return opts, sev, failOn, -1
+}
 
+// signalContext cancels on SIGINT/SIGTERM; a second signal keeps the default
+// handling and terminates immediately.
+func signalContext() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		sig := <-sigChan
-		// Restore default handling: a second Ctrl+C terminates immediately.
 		signal.Stop(sigChan)
 		log.Warn().Str("signal", sig.String()).Msg("Shutdown signal received, finishing up (press Ctrl+C again to force exit)")
 		cancel()
 	}()
+	return ctx, cancel
+}
 
-	if opts.OnlyUpdate {
-		if err := updateTrivyDB(ctx); err != nil {
-			log.Error().Err(err).Msg("DB update failed")
-			return 1
-		}
-		return 0
-	}
-
+// collectInputs merges -i values with the lines read from -l.
+func collectInputs(opts options) ([]string, error) {
 	var inputs []string
 	for _, in := range opts.Inputs {
 		if in = strings.TrimSpace(in); in != "" {
@@ -942,54 +934,50 @@ func run() int {
 	if opts.ListFile != "" {
 		listed, err := readTargetList(opts.ListFile)
 		if err != nil {
-			log.Error().Err(err).Msg("Error reading -l")
-			return 1
+			return nil, err
 		}
 		inputs = append(inputs, listed...)
 	}
-	if len(inputs) == 0 {
-		log.Error().Msg("Input required: -i nginx:latest,app:dev OR -i image.tar OR -i ./directory OR -l images.txt")
-		return 1
-	}
-	if opts.MaxDepth < 1 {
-		log.Error().Int("max_depth", opts.MaxDepth).Msg("--max-depth must be at least 1")
-		return 1
-	}
-	if opts.Timeout <= 0 {
-		log.Error().Dur("timeout", opts.Timeout).Msg("--timeout must be positive")
-		return 1
-	}
+	return inputs, nil
+}
 
+// setupTrivy verifies the trivy installation and refreshes the databases,
+// honouring --skip-trivy-check and --skip-db-update. It reports whether the run
+// may continue.
+func setupTrivy(ctx context.Context, opts options) bool {
 	if !opts.SkipTrivyCheck {
 		if err := checkTrivyInstalled(ctx); err != nil {
 			log.Error().Err(err).Msg("Trivy check failed")
-			return 1
+			return false
 		}
 	}
-
 	if !opts.SkipDBUpdate {
 		if err := updateTrivyDB(ctx); err != nil {
 			log.Warn().Err(err).Msg("DB update failed, continuing with existing DB")
 		}
 	}
+	return true
+}
 
+// prepareTargets resolves the inputs, creates the JSON directory and assigns
+// every target its report stem, hashing each tar once (cached by size+mtime).
+func prepareTargets(ctx context.Context, inputs []string, opts options) ([]scanTarget, string, bool) {
 	targets, err := resolveInputs(inputs, opts.MaxDepth)
 	if err != nil {
 		log.Error().Err(err).Msg("Error resolving input")
-		return 1
+		return nil, "", false
 	}
 	if len(targets) == 0 {
 		log.Error().Strs("inputs", inputs).Msg("No scannable targets found")
-		return 1
+		return nil, "", false
 	}
 
 	jsonDir := filepath.Join(opts.Output, jsonSubdir)
 	if err := os.MkdirAll(jsonDir, 0755); err != nil {
 		log.Error().Err(err).Msg("Cannot create output directory")
-		return 1
+		return nil, "", false
 	}
 
-	// Hash each tar once (cached by size+mtime); the stem is reused for retries and all output files.
 	log.Info().Int("targets", len(targets)).Msg("Hashing inputs")
 	hashes := loadHashCache(filepath.Join(jsonDir, hashCacheFile))
 	usedHashes := map[string]bool{}
@@ -999,7 +987,7 @@ func run() int {
 			h, err = hashes.hash(ctx, targets[i].Input, opts.Force)
 			if ctx.Err() != nil {
 				log.Warn().Msg("Cancelled while hashing inputs")
-				return 1
+				return nil, "", false
 			}
 			if err != nil {
 				log.Warn().Str("input", targets[i].Input).Err(err).Msg("Cannot hash input, naming report by path")
@@ -1017,34 +1005,18 @@ func run() int {
 	if err := hashes.save(keepHashes); err != nil {
 		log.Warn().Err(err).Msg("Cannot save hash cache")
 	}
+	return targets, jsonDir, true
+}
 
-	rows := map[string]summaryRow{}
-	summaryPath := filepath.Join(opts.Output, htmlSubdir, summaryFile)
-	summaryFailed := false
-	writeSummary := func() {
-		if err := writeFileAtomic(summaryPath, func(w io.Writer) error { return renderSummary(w, rows, sev) }); err != nil {
-			log.Error().Err(err).Str("file", summaryPath).Msg("Summary write failed")
-			summaryFailed = true
-		}
-	}
-
-	if !opts.Prune {
-		loadPreviousReports(opts.Output, targets, sev, rows)
-	}
-
+// scanAll scans every target sequentially, filling rows and refreshing the
+// summary after each target, and returns the results grouped by status.
+func scanAll(ctx context.Context, targets []scanTarget, jsonDir string, opts options, sev severitySet, rows map[string]summaryRow, writeSummary func()) (success, skipped, failed []scanResult) {
 	dbTime, haveDBTime := dbDownloadedAt()
 	if !haveDBTime && !opts.Force {
 		log.Debug().Msg("Trivy DB metadata unavailable, every target will be scanned")
 	}
 
 	log.Info().Str("version", version).Int("targets", len(targets)).Msg("Starting scan")
-
-	startTime := time.Now()
-	var (
-		successResults []scanResult
-		skippedResults []scanResult
-		failResults    []scanResult
-	)
 
 	for i, target := range targets {
 		if ctx.Err() != nil {
@@ -1059,7 +1031,7 @@ func run() int {
 		// Image references can change upstream under the same name, so only tars are reused.
 		if !opts.Force && haveDBTime && target.Kind == inputTypeTar && isReportFresh(jsonPath, dbTime) {
 			log.Info().Str("input", target.Input).Str("json", jsonPath).Msg("Report up to date, skipping scan (use --force to rescan)")
-			result = scanResult{Target: target, JSONFile: jsonPath, Cached: true}
+			result = scanResult{Target: target, Cached: true}
 		} else {
 			result = scanOne(ctx, target, jsonPath, opts.Scanner, opts.Timeout, opts.MaxRetries)
 		}
@@ -1077,74 +1049,154 @@ func run() int {
 
 		switch {
 		case result.Error == nil:
-			successResults = append(successResults, result)
+			success = append(success, result)
 		case result.Skipped:
-			skippedResults = append(skippedResults, result)
+			skipped = append(skipped, result)
 			rows[target.Stem] = errorRow(target, statusSkipped, result.Error)
 			writeSummary()
 		default:
 			log.Error().Str("input", result.Target.Input).Err(result.Error).Msg("Failed, continuing to next target")
-			failResults = append(failResults, result)
+			failed = append(failed, result)
 			rows[target.Stem] = errorRow(target, statusFailed, result.Error)
 			writeSummary()
 		}
 	}
+	return success, skipped, failed
+}
 
-	if opts.Prune {
-		if ctx.Err() != nil {
-			log.Warn().Msg("Run was cancelled, skipping --prune")
-		} else {
-			keep := make(map[string]bool, len(targets))
-			for _, t := range targets {
-				keep[t.Stem] = true
-			}
-			pruneReports(opts.Output, keep)
-		}
+// pruneStaleReports removes reports that are not part of this run, unless the
+// run was cancelled.
+func pruneStaleReports(ctx context.Context, outputDir string, targets []scanTarget) {
+	if ctx.Err() != nil {
+		log.Warn().Msg("Run was cancelled, skipping --prune")
+		return
 	}
+	keep := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		keep[t.Stem] = true
+	}
+	pruneReports(outputDir, keep)
+}
 
-	// Always write the summary at the end, also when nothing succeeded this run.
-	writeSummary()
-
-	elapsed := time.Since(startTime)
-
+// logScanSummary logs per-target results and the totals line.
+func logScanSummary(success, skipped, failed []scanResult, elapsed time.Duration, total int, summaryPath string) {
 	cached := 0
 	log.Info().Msg("── SCAN SUMMARY ──────────────────────────────")
-	for _, r := range successResults {
+	for _, r := range success {
 		if r.Cached {
 			cached++
 		}
 		log.Info().Str("input", r.Target.Input).Str("html", r.HTMLFile).Bool("cached", r.Cached).Dur("duration", r.Duration).Msg("OK")
 	}
-	for _, r := range skippedResults {
+	for _, r := range skipped {
 		log.Warn().Str("input", r.Target.Input).Msg("SKIPPED (invalid Docker/OCI tar)")
 	}
-	for _, r := range failResults {
+	for _, r := range failed {
 		log.Error().Str("input", r.Target.Input).Err(r.Error).Msg("FAILED")
 	}
 	log.Info().
 		Dur("duration", elapsed).
-		Int("success", len(successResults)).
+		Int("success", len(success)).
 		Int("cached", cached).
-		Int("skipped", len(skippedResults)).
-		Int("failed", len(failResults)).
-		Int("total", len(targets)).
+		Int("skipped", len(skipped)).
+		Int("failed", len(failed)).
+		Int("total", total).
 		Str("summary", summaryPath).
 		Msg("Complete")
+}
 
-	if len(failResults) > 0 || summaryFailed {
+// scanExitCode returns 1 when a target or the summary failed, 2 when --fail-on
+// is hit, and 0 otherwise.
+func scanExitCode(failOn string, success, failed []scanResult, rows map[string]summaryRow, summaryFailed bool) int {
+	if len(failed) > 0 || summaryFailed {
 		return 1
 	}
-	if failOn != "" {
-		var over []string
-		for _, r := range successResults {
-			if w := rows[r.Target.Stem].Worst; w != "" && atLeast(w, failOn) {
-				over = append(over, r.Target.Input)
-			}
-		}
-		if len(over) > 0 {
-			log.Error().Str("fail_on", failOn).Strs("targets", over).Msg("Vulnerabilities at or above threshold")
-			return 2
+	if failOn == "" {
+		return 0
+	}
+	var over []string
+	for _, r := range success {
+		if w := rows[r.Target.Stem].Worst; w != "" && atLeast(w, failOn) {
+			over = append(over, r.Target.Input)
 		}
 	}
+	if len(over) > 0 {
+		log.Error().Str("fail_on", failOn).Strs("targets", over).Msg("Vulnerabilities at or above threshold")
+		return 2
+	}
 	return 0
+}
+
+// run contains all application logic and returns an exit code.
+// Using a separate function keeps main clean and ensures defers always execute.
+func run() int {
+	opts, sev, failOn, code := loadOptions()
+	if code >= 0 {
+		return code
+	}
+
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	if opts.OnlyUpdate {
+		if err := updateTrivyDB(ctx); err != nil {
+			log.Error().Err(err).Msg("DB update failed")
+			return 1
+		}
+		return 0
+	}
+
+	inputs, err := collectInputs(opts)
+	if err != nil {
+		log.Error().Err(err).Msg("Error reading -l")
+		return 1
+	}
+	if len(inputs) == 0 {
+		log.Error().Msg("Input required: -i nginx:latest,app:dev OR -i image.tar OR -i ./directory OR -l images.txt")
+		return 1
+	}
+	if opts.MaxDepth < 1 {
+		log.Error().Int("max_depth", opts.MaxDepth).Msg("--max-depth must be at least 1")
+		return 1
+	}
+	if opts.Timeout <= 0 {
+		log.Error().Dur("timeout", opts.Timeout).Msg("--timeout must be positive")
+		return 1
+	}
+
+	if !setupTrivy(ctx, opts) {
+		return 1
+	}
+
+	targets, jsonDir, ok := prepareTargets(ctx, inputs, opts)
+	if !ok {
+		return 1
+	}
+
+	rows := map[string]summaryRow{}
+	summaryPath := filepath.Join(opts.Output, htmlSubdir, summaryFile)
+	summaryFailed := false
+	writeSummary := func() {
+		if err := writeSummaryFile(summaryPath, rows, sev); err != nil {
+			log.Error().Err(err).Str("file", summaryPath).Msg("Summary write failed")
+			summaryFailed = true
+		}
+	}
+
+	if !opts.Prune {
+		loadPreviousReports(opts.Output, targets, sev, rows)
+	}
+
+	startTime := time.Now()
+	success, skipped, failed := scanAll(ctx, targets, jsonDir, opts, sev, rows, writeSummary)
+
+	if opts.Prune {
+		pruneStaleReports(ctx, opts.Output, targets)
+	}
+
+	// Always write the summary at the end, also when nothing succeeded this run.
+	writeSummary()
+
+	logScanSummary(success, skipped, failed, time.Since(startTime), len(targets), summaryPath)
+	return scanExitCode(failOn, success, failed, rows, summaryFailed)
 }
