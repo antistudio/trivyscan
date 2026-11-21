@@ -1,366 +1,683 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# Trivy + TrivyScan installer for Linux / macOS
+# Trivy + TrivyScan installer for Linux and macOS.
 #
-# Usage (remote):
-#   curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | sudo bash
+# Per-user (default, no sudo):
+#   curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | bash
 #
-# Usage (local, from an extracted release archive):
-#   ./install.sh
+# System-wide:
+#   curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | sudo bash -s -- --system
 #
-# Every download is verified against the release's SHA-256 checksums file.
-# Set TRIVYSCAN_SKIP_CHECKSUM=1 to install without verification (not recommended).
+# The installer always checks the latest release. Newer local versions are kept
+# unless an explicit version or --force asks for a change. After a successful
+# install it runs `trivyscan -u` to refresh the vulnerability databases.
+# Every remote download is verified against the release SHA-256 checksums.
 
-# =========================================
-# Config
-# =========================================
-TRIVY_INSTALL_DIR="/usr/local/bin"
-TRIVYSCAN_INSTALL_DIR="/usr/local/bin"
-TRIVYSCAN_REPO="antistudio/trivyscan"
+set -euo pipefail
 
-# SCRIPT_DIR is only meaningful when run from a file; under `curl | bash`
-# BASH_SOURCE is empty and the binary is downloaded instead.
-SCRIPT_DIR=""
-if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
+REPO="antistudio/trivyscan"
+TRIVY_REPO="aquasecurity/trivy"
+TRIVY_MIN_VERSION="0.70.0"
+MARKER_START="# >>> trivyscan installer >>>"
+MARKER_END="# <<< trivyscan installer <<<"
 
-# =========================================
-# Args
-# =========================================
+SYSTEM=false
+PREFIX="${TRIVYSCAN_PREFIX:-}"
 FORCE=false
 UNINSTALL=false
-for arg in "$@"; do
-    case "$arg" in
-        --force|-f) FORCE=true ;;
-        --uninstall|-u) UNINSTALL=true ;;
-        --help|-h)
-            echo "Usage: ./install.sh [OPTIONS]"
-            echo "  --force, -f     Force reinstall"
-            echo "  --uninstall, -u Uninstall both"
-            echo "  --help, -h      Show this help"
-            exit 0
-            ;;
-    esac
-done
+PURGE=false
+SKIP_DB="${TRIVYSCAN_SKIP_DB_UPDATE:-}"
+STRICT="${TRIVYSCAN_STRICT:-}"
+NO_PATH="${TRIVYSCAN_NO_PATH:-}"
+TRIVYSCAN_VERSION="${TRIVYSCAN_VERSION:-}"
+TRIVY_VERSION="${TRIVY_VERSION:-}"
 
-# =========================================
-# Helpers
-# =========================================
+BIN_DIR=""
+SHARE_DIR=""
+MANIFEST=""
+TMP_DIR=""
+OS_GO=""
+OS_TRIVY=""
+ARCH_GO=""
+ARCH_TRIVY=""
+SUDO_USER_NAME="${SUDO_USER:-}"
+
+TRIVYSCAN_ACTION="not installed"
+TRIVY_ACTION="not installed"
+TRIVYSCAN_INSTALLED_VERSION=""
+TRIVY_INSTALLED_VERSION=""
+TRIVY_MANAGED=0
+TRIVY_BIN_PATH=""
+DB_RESULT="skipped"
+DB_FAILED=0
+PATH_FILE=""
+PATH_MODIFIED=0
+
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_warn() { printf '[WARN] %s\n' "$*" >&2; }
+log_error() { printf '[ERROR] %s\n' "$*" >&2; }
+die() {
+    log_error "$*"
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: install.sh [OPTIONS]
+
+Options:
+  --system                   Install system-wide (requires root/sudo)
+  --prefix DIR               Install prefix (default: $HOME/.local, or /usr/local)
+  --trivyscan-version V      Install a specific TrivyScan version
+  --trivy-version V          Install a specific Trivy version
+  --skip-db-update           Do not run `trivyscan -u` after installing
+  --strict                   Exit 1 when the database update fails
+  --no-modify-path           Do not modify the shell profile
+  --force, -f                Reinstall even when the version is unchanged
+  --uninstall, -u            Uninstall managed binaries
+  --purge                    With --uninstall, also remove the Trivy DB cache
+  --help, -h                 Show this help
+
+Environment:
+  TRIVYSCAN_VERSION, TRIVY_VERSION, TRIVYSCAN_PREFIX,
+  TRIVYSCAN_SKIP_DB_UPDATE=1, TRIVYSCAN_STRICT=1, TRIVYSCAN_NO_PATH=1
+EOF
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --system) SYSTEM=true ;;
+            --prefix)
+                [ "$#" -ge 2 ] || die "--prefix requires a directory"
+                PREFIX="$2"
+                shift
+                ;;
+            --trivyscan-version)
+                [ "$#" -ge 2 ] || die "--trivyscan-version requires a version"
+                TRIVYSCAN_VERSION="$2"
+                shift
+                ;;
+            --trivy-version)
+                [ "$#" -ge 2 ] || die "--trivy-version requires a version"
+                TRIVY_VERSION="$2"
+                shift
+                ;;
+            --skip-db-update) SKIP_DB=1 ;;
+            --strict) STRICT=1 ;;
+            --no-modify-path) NO_PATH=1 ;;
+            --force|-f) FORCE=true ;;
+            --uninstall|-u) UNINSTALL=true ;;
+            --purge) PURGE=true ;;
+            --help|-h) usage; exit 0 ;;
+            *) die "Unknown option: $1 (use --help)" ;;
+        esac
+        shift
+    done
+    if [ "$PURGE" = true ]; then
+        UNINSTALL=true
+    fi
+    return 0
+}
+
 run_privileged() {
-    if [ "$(id -u)" -eq 0 ]; then "$@"
-    else sudo "$@"
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
     fi
 }
 
-# Private temp dir: a fixed /tmp path could be pre-created by another user
-# and its contents would then be installed as root.
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trivyscan-install.XXXXXX")" || {
-    echo "[ERROR] Cannot create temp directory"
-    exit 1
+check_dependencies() {
+    for cmd in uname id mktemp tar awk grep sed tr install; do
+        command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required"
+    done
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || \
+        die "curl or wget is required"
+    command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || \
+        command -v openssl >/dev/null 2>&1 || die "sha256sum, shasum or openssl is required"
 }
-trap 'rm -rf "$TMP_DIR"' EXIT
 
-# fetch URL OUTPUT — download following redirects, fail on HTTP errors.
-fetch() {
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$1" -o "$2"
-    elif command -v wget &>/dev/null; then
-        wget -q "$1" -O "$2"
+setup_paths() {
+    if [ "$SYSTEM" = true ]; then
+        [ "$(id -u)" -eq 0 ] || die "Re-run with sudo for --system: sudo bash -s -- --system"
+        PREFIX="${PREFIX:-/usr/local}"
     else
-        echo "[ERROR] curl or wget is required"
+        if [ "$(id -u)" -eq 0 ] && [ -n "$SUDO_USER_NAME" ] && [ "$SUDO_USER_NAME" != "root" ]; then
+            die "Run without sudo for a per-user install, or pass --system for a system-wide install"
+        fi
+        [ -n "${HOME:-}" ] || die "HOME is not set"
+        PREFIX="${PREFIX:-$HOME/.local}"
+    fi
+    BIN_DIR="$PREFIX/bin"
+    SHARE_DIR="$PREFIX/share/trivyscan"
+    MANIFEST="$SHARE_DIR/install.env"
+    umask 022
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trivyscan-install.XXXXXX")" || die "Cannot create temp directory"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+    if [ "$SYSTEM" = true ]; then
+        run_privileged mkdir -p "$BIN_DIR"
+    else
+        mkdir -p "$BIN_DIR"
+    fi
+}
+
+detect_os_arch() {
+    case "$(uname -s)" in
+        Linux)  OS_GO="linux";  OS_TRIVY="Linux" ;;
+        Darwin) OS_GO="darwin"; OS_TRIVY="macOS" ;;
+        *) die "Unsupported OS: $(uname -s)" ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64)  ARCH_GO="amd64"; ARCH_TRIVY="64bit" ;;
+        arm64|aarch64) ARCH_GO="arm64"; ARCH_TRIVY="ARM64" ;;
+        *) die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+normalize_version() {
+    printf '%s' "${1#v}"
+}
+
+version_lt() {
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        n = split(a, x, "."); m = split(b, y, ".")
+        for (i = 1; i <= n || i <= m; i++) {
+            ai = (i <= n ? x[i] : 0) + 0
+            bi = (i <= m ? y[i] : 0) + 0
+            if (ai < bi) exit 0
+            if (ai > bi) exit 1
+        }
+        exit 1
+    }'
+}
+
+get_binary_version() {
+    local out
+    out="$("$1" --version 2>/dev/null || true)"
+    printf '%s\n' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true
+}
+
+fetch() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused \
+            --connect-timeout 10 "$url" -o "$out"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --tries=3 --timeout=30 "$url" -O "$out"
+    else
         return 1
     fi
 }
 
-# latest_tag REPO — print the latest release tag without the leading "v".
-# github.com/<repo>/releases/latest redirects to .../releases/tag/<tag>; unlike
-# the REST API it has no 60 requests/hour limit, so curl uses it first.
 latest_tag() {
-    local tag=""
-    if command -v curl &>/dev/null; then
-        tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$1/releases/latest" 2>/dev/null)"
+    local repo="$1" tag="" json="$TMP_DIR/release.json"
+    if command -v curl >/dev/null 2>&1; then
+        tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+            "https://github.com/$repo/releases/latest" 2>/dev/null || true)"
         tag="${tag##*/releases/tag/}"
     fi
-    if ! echo "$tag" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+'; then
-        local json="$TMP_DIR/release.json"
-        fetch "https://api.github.com/repos/$1/releases/latest" "$json" 2>/dev/null || return 1
-        tag="$(grep '"tag_name"' "$json" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    if ! printf '%s' "$tag" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+'; then
+        fetch "https://api.github.com/repos/$repo/releases/latest" "$json" >/dev/null 2>&1 || return 1
+        tag="$(grep -m1 '"tag_name"' "$json" 2>/dev/null | \
+            sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
     fi
-    echo "${tag#v}"
+    printf '%s' "$tag" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+' || return 1
+    normalize_version "$tag"
 }
 
 sha256_of() {
-    if command -v sha256sum &>/dev/null; then
+    if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
-    elif command -v shasum &>/dev/null; then
+    elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
     else
         return 1
     fi
 }
 
-# verify FILE CHECKSUMS_FILE NAME — compare FILE against the line for NAME.
-verify() {
+verify_checksum() {
     local file="$1" sums="$2" name="$3" expected actual
-    if [ "${TRIVYSCAN_SKIP_CHECKSUM:-}" = "1" ]; then
-        echo "[WARN] TRIVYSCAN_SKIP_CHECKSUM=1: NOT verifying $name"
+    expected="$(tr -d '\r' < "$sums" | awk -v n="$name" '$2 == n || $2 == "*"n {print $1; exit}')"
+    if [ -z "$expected" ]; then
+        log_error "No checksum for $name in $sums"
+        return 1
+    fi
+    if [ "${#expected}" -ne 64 ]; then
+        log_error "Malformed checksum for $name"
+        return 1
+    fi
+    actual="$(sha256_of "$file")" || {
+        log_error "Cannot compute SHA-256 for $name"
+        return 1
+    }
+    if [ "$expected" != "$actual" ]; then
+        log_error "Checksum mismatch for $name"
+        log_error "  expected $expected"
+        log_error "  got      $actual"
+        return 1
+    fi
+    log_info "Checksum verified: $name"
+    return 0
+}
+
+download_verified() {
+    local repo="$1" version="$2" asset="$3" sums_name="$4" outdir="$5"
+    local base="https://github.com/$repo/releases/download/v${version}"
+    mkdir -p "$outdir"
+    log_info "Downloading $asset..."
+    fetch "$base/$asset" "$outdir/$asset" || die "Download failed: $base/$asset"
+    fetch "$base/$sums_name" "$outdir/$sums_name" || die "Download failed: $base/$sums_name"
+    verify_checksum "$outdir/$asset" "$outdir/$sums_name" "$asset" || die "Refusing to install unverified $asset"
+    DL_ARCHIVE="$outdir/$asset"
+}
+
+extract_binary() {
+    local archive="$1" dir="$2" name="$3"
+    mkdir -p "$dir"
+    tar -xzf "$archive" -C "$dir" || return 1
+    [ -f "$dir/$name" ] || return 1
+    printf '%s' "$dir/$name"
+}
+
+install_binary() {
+    local src="$1" dest="$2" expected="${3:-}"
+    local tmp="$dest.tmp.$$" bak="$dest.bak.$$" had=0 got
+    if [ -e "$dest" ]; then
+        run_privileged cp -p "$dest" "$bak" || return 1
+        had=1
+    fi
+    if ! run_privileged install -m 0755 "$src" "$tmp"; then
+        if [ "$had" -eq 1 ]; then run_privileged rm -f "$bak"; fi
+        return 1
+    fi
+    if ! run_privileged mv -f "$tmp" "$dest"; then
+        run_privileged rm -f "$tmp"
+        if [ "$had" -eq 1 ]; then run_privileged rm -f "$bak"; fi
+        return 1
+    fi
+    got="$(get_binary_version "$dest")"
+    if [ -n "$expected" ] && [ "$got" != "$expected" ]; then
+        log_error "$dest reports '$got', expected '$expected'; rolling back"
+        if [ "$had" -eq 1 ]; then
+            run_privileged mv -f "$bak" "$dest"
+        else
+            run_privileged rm -f "$dest"
+        fi
+        return 1
+    fi
+    if [ "$had" -eq 1 ]; then run_privileged rm -f "$bak"; fi
+    return 0
+}
+
+write_manifest() {
+    local tmp="$TMP_DIR/install.env"
+    {
+        printf 'installer=trivyscan\n'
+        printf 'layout=unix\n'
+        printf 'prefix=%s\n' "$PREFIX"
+        printf 'bin_dir=%s\n' "$BIN_DIR"
+        printf 'trivyscan_path=%s\n' "$BIN_DIR/trivyscan"
+        printf 'trivyscan_version=%s\n' "$1"
+        printf 'trivy_version=%s\n' "$2"
+        printf 'trivy_managed=%s\n' "$TRIVY_MANAGED"
+        printf 'trivy_path=%s\n' "$TRIVY_BIN_PATH"
+        printf 'path_file=%s\n' "$PATH_FILE"
+        printf 'path_modified=%s\n' "$PATH_MODIFIED"
+        printf 'installed_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    } > "$tmp"
+    run_privileged mkdir -p "$SHARE_DIR"
+    run_privileged install -m 0644 "$tmp" "$MANIFEST"
+}
+
+path_has_bin() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+add_path_block() {
+    local rc="$1"
+    [ -f "$rc" ] || : > "$rc" || return 1
+    grep -qF "$MARKER_START" "$rc" 2>/dev/null && return 0
+    {
+        printf '\n%s\n' "$MARKER_START"
+        # shellcheck disable=SC2016 # $PATH must be written literally to the profile.
+        printf 'case ":$PATH:" in *":%s:"*) ;; *) export PATH="%s:$PATH";; esac\n' "$BIN_DIR" "$BIN_DIR"
+        printf '%s\n' "$MARKER_END"
+    } >> "$rc"
+    PATH_MODIFIED=1
+    PATH_FILE="$rc"
+}
+
+remove_path_block() {
+    local rc="$1" tmp="$TMP_DIR/rc.$$"
+    [ -n "$rc" ] && [ -f "$rc" ] || return 0
+    awk -v start="$MARKER_START" -v end="$MARKER_END" '
+        $0 == start { skip = 1; next }
+        $0 == end { skip = 0; next }
+        !skip { print }
+    ' "$rc" > "$tmp" || return 1
+    cat "$tmp" > "$rc"
+}
+
+configure_path() {
+    if path_has_bin; then
+        log_info "PATH already contains $BIN_DIR"
         return 0
     fi
-    expected="$(awk -v n="$name" '$2 == n || $2 == "*"n {print $1; exit}' "$sums")"
-    if [ -z "$expected" ]; then
-        echo "[ERROR] No checksum for $name in checksums file"
-        return 1
+    if [ "$NO_PATH" = "1" ]; then
+        log_warn "$BIN_DIR is not in PATH; add it manually"
+        return 0
     fi
-    if ! actual="$(sha256_of "$file")"; then
-        echo "[ERROR] sha256sum or shasum is required to verify downloads"
-        echo "        (set TRIVYSCAN_SKIP_CHECKSUM=1 to install without verification)"
-        return 1
+    if [ "$SYSTEM" = true ]; then
+        log_warn "$BIN_DIR is not in PATH; add it manually for system-wide use"
+        return 0
     fi
-    if [ "$expected" != "$actual" ]; then
-        echo "[ERROR] Checksum mismatch for $name"
-        echo "        expected $expected"
-        echo "        got      $actual"
-        return 1
+    local rc
+    case "${SHELL:-}" in
+        *zsh) rc="$HOME/.zshrc" ;;
+        *bash)
+            if [ "$(uname -s)" = "Darwin" ]; then
+                rc="$HOME/.bash_profile"
+            else
+                rc="$HOME/.bashrc"
+            fi
+            ;;
+        *) rc="$HOME/.profile" ;;
+    esac
+    if add_path_block "$rc"; then
+        log_info "Added $BIN_DIR to PATH in $rc"
+    else
+        log_warn "Could not update $rc; add $BIN_DIR to PATH manually"
     fi
-    echo "[OK] Checksum verified: $name"
 }
 
-# =========================================
-# Uninstall
-# =========================================
-if [ "$UNINSTALL" = true ]; then
-    echo ""
-    echo "[INFO] Uninstalling..."
-
-    if [ -f "$TRIVY_INSTALL_DIR/trivy" ]; then
-        run_privileged rm -f "$TRIVY_INSTALL_DIR/trivy"
-        echo "[OK] Removed $TRIVY_INSTALL_DIR/trivy"
+run_db_update() {
+    if [ "$SKIP_DB" = "1" ]; then
+        DB_RESULT="skipped"
+        log_info "Skipping database update"
+        return 0
     fi
+    [ -x "$BIN_DIR/trivyscan" ] || { DB_RESULT="failed"; DB_FAILED=1; log_warn "trivyscan is not executable"; return 0; }
+    [ -n "$TRIVY_BIN_PATH" ] || { DB_RESULT="failed"; DB_FAILED=1; log_warn "Trivy is unavailable; run trivyscan -u later"; return 0; }
 
-    if [ -f "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
-        run_privileged rm -f "$TRIVYSCAN_INSTALL_DIR/trivyscan"
-        echo "[OK] Removed $TRIVYSCAN_INSTALL_DIR/trivyscan"
-    fi
-
-    echo ""
-    echo "[SUCCESS] Uninstall complete! Restart your terminal."
-    exit 0
-fi
-
-# =========================================
-# Detect OS + Arch
-# =========================================
-OS=$(uname -s)
-ARCH=$(uname -m)
-
-case "$ARCH" in
-    x86_64)        ARCH_GO="amd64"; ARCH_TRIVY="64bit" ;;
-    aarch64|arm64) ARCH_GO="arm64"; ARCH_TRIVY="ARM64" ;;
-    *)
-        echo "[ERROR] Unsupported architecture: $ARCH"
-        exit 1
-        ;;
-esac
-
-case "$OS" in
-    Linux)  OS_GO="linux";  OS_TRIVY="Linux"  ;;
-    Darwin) OS_GO="darwin"; OS_TRIVY="macOS"  ;;
-    *)
-        echo "[ERROR] Unsupported OS: $OS"
-        exit 1
-        ;;
-esac
-
-echo "========================================="
-echo "      Trivy + TrivyScan Installer"
-echo "========================================="
-echo "[INFO] OS: $OS | Arch: $ARCH_GO"
-
-trivy_updated=false
-trivyscan_updated=false
-trivyscan_failed=false
-
-# =========================================
-# Step 1: Install/Update Trivy
-# =========================================
-echo ""
-echo "[INFO] Checking Trivy..."
-
-current_trivy=""
-if command -v trivy &>/dev/null; then
-    current_trivy=$(trivy --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-fi
-
-latest_trivy="$(latest_tag aquasecurity/trivy)"
-
-if [ -z "$latest_trivy" ]; then
-    echo "[WARN] Cannot fetch Trivy version - skipping"
-elif ! $FORCE && [ -n "$current_trivy" ] && [ "$current_trivy" = "$latest_trivy" ]; then
-    echo "[OK] Trivy already up to date (v$current_trivy)"
-else
-    if [ -n "$current_trivy" ]; then
-        echo "[INFO] Current version: $current_trivy, updating to v$latest_trivy..."
+    log_info "Updating Trivy databases (trivyscan -u)..."
+    local ok=1
+    if [ "$SYSTEM" = true ] && [ -n "$SUDO_USER_NAME" ] && [ "$SUDO_USER_NAME" != "root" ]; then
+        sudo -u "$SUDO_USER_NAME" -H env PATH="$BIN_DIR:$PATH" TRIVY_BIN="$TRIVY_BIN_PATH" \
+            "$BIN_DIR/trivyscan" -u || ok=0
     else
-        echo "[INFO] Trivy not found, installing v$latest_trivy..."
+        if [ "$SYSTEM" = true ] && [ -z "$SUDO_USER_NAME" ]; then
+            log_warn "Running database update as root; the DB will be cached for root"
+        fi
+        env PATH="$BIN_DIR:$PATH" TRIVY_BIN="$TRIVY_BIN_PATH" "$BIN_DIR/trivyscan" -u || ok=0
+    fi
+    if [ "$ok" -eq 1 ]; then
+        DB_RESULT="updated"
+        log_info "Databases updated"
+    else
+        DB_RESULT="failed"
+        DB_FAILED=1
+        log_warn "Database update failed; run 'trivyscan -u' later"
+    fi
+}
+
+read_manifest_value() {
+    [ -f "$MANIFEST" ] || return 1
+    grep "^$1=" "$MANIFEST" 2>/dev/null | head -n 1 | cut -d= -f2-
+}
+
+do_uninstall() {
+    local trivyscan_path="$BIN_DIR/trivyscan"
+    local trivy_path=""
+    local tv_managed="0" path_file=""
+
+    if [ -f "$MANIFEST" ]; then
+        trivyscan_path="$(read_manifest_value trivyscan_path || true)"
+        [ -n "$trivyscan_path" ] || trivyscan_path="$BIN_DIR/trivyscan"
+        tv_managed="$(read_manifest_value trivy_managed || true)"
+        trivy_path="$(read_manifest_value trivy_path || true)"
+        path_file="$(read_manifest_value path_file || true)"
+    else
+        log_warn "No install manifest found; using safe fallback"
+        [ "$FORCE" = true ] || log_warn "Pass --force to remove $trivyscan_path without a manifest"
+        [ "$FORCE" = true ] || { log_info "Nothing removed"; return 0; }
     fi
 
-    base="https://github.com/aquasecurity/trivy/releases/download/v${latest_trivy}"
-    asset="trivy_${latest_trivy}_${OS_TRIVY}-${ARCH_TRIVY}.tar.gz"
-    sums="trivy_${latest_trivy}_checksums.txt"
-    extract_dir="$TMP_DIR/trivy"
+    if [ -f "$trivyscan_path" ]; then
+        run_privileged rm -f "$trivyscan_path" && log_info "Removed $trivyscan_path"
+    fi
+    if [ "$tv_managed" = "1" ] && [ -n "$trivy_path" ] && [ -f "$trivy_path" ]; then
+        run_privileged rm -f "$trivy_path" && log_info "Removed $trivy_path"
+    fi
+    if [ -f "$MANIFEST" ]; then
+        run_privileged rm -f "$MANIFEST"
+        run_privileged rmdir "$SHARE_DIR" 2>/dev/null || true
+    fi
+    remove_path_block "$path_file" || log_warn "Could not clean PATH block in $path_file"
 
-    echo "[INFO] Downloading from: $base/$asset"
-    if ! fetch "$base/$asset" "$TMP_DIR/$asset" || ! fetch "$base/$sums" "$TMP_DIR/$sums"; then
-        echo "[ERROR] Download failed"
-    elif ! verify "$TMP_DIR/$asset" "$TMP_DIR/$sums" "$asset"; then
-        echo "[ERROR] Trivy not installed"
-    else
-        echo "[INFO] Extracting..."
-        mkdir -p "$extract_dir"
-        tar -xzf "$TMP_DIR/$asset" -C "$extract_dir"
-
-        if [ ! -f "$extract_dir/trivy" ]; then
-            echo "[ERROR] trivy binary not found after extraction"
+    if [ "$PURGE" = true ]; then
+        if [ "$SYSTEM" = true ] && [ -n "$SUDO_USER_NAME" ] && [ "$SUDO_USER_NAME" != "root" ]; then
+            sudo -u "$SUDO_USER_NAME" -H sh -c 'rm -rf "$HOME/.cache/trivy"'
+            log_info "Removed Trivy DB cache for $SUDO_USER_NAME"
+        elif [ "$SYSTEM" = true ]; then
+            log_warn "Skipping DB purge for a system install; remove the user cache manually"
         else
-            run_privileged install -m 755 "$extract_dir/trivy" "$TRIVY_INSTALL_DIR/trivy"
-            echo "[OK] Trivy installed/updated to v$latest_trivy"
-            trivy_updated=true
+            run_privileged rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/trivy"
+            log_info "Removed Trivy DB cache"
         fi
     fi
-fi
+    echo ""
+    log_info "Uninstall complete"
+}
 
-# =========================================
-# Step 2: Install/Update TrivyScan
-# =========================================
-echo ""
-echo "[INFO] Checking TrivyScan..."
-
-current_trivyscan=""
-if [ -x "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
-    current_trivyscan=$("$TRIVYSCAN_INSTALL_DIR/trivyscan" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-fi
-
-# Local mode: binary next to this script (extracted archive; older archives used trivyscan_<os>).
-source_bin=""
-if [ -n "$SCRIPT_DIR" ]; then
-    for name in trivyscan "trivyscan_${OS_GO}"; do
-        if [ -f "$SCRIPT_DIR/$name" ]; then
-            source_bin="$SCRIPT_DIR/$name"
-            break
-        fi
-    done
-fi
-
-if [ -n "$source_bin" ]; then
-    echo "[INFO] Using local binary: $source_bin"
-    if ! $FORCE && [ -n "$current_trivyscan" ]; then
-        echo "[OK] TrivyScan already installed (use --force to reinstall)"
-        source_bin=""
+resolve_existing_trivyscan() {
+    local path=""
+    if [ -x "$BIN_DIR/trivyscan" ]; then
+        path="$BIN_DIR/trivyscan"
+    elif command -v trivyscan >/dev/null 2>&1; then
+        path="$(command -v trivyscan)"
+    elif [ -x "/usr/local/bin/trivyscan" ]; then
+        path="/usr/local/bin/trivyscan"
     fi
-else
-    # Remote mode: download the release archive for this OS/arch.
-    latest_trivyscan="$(latest_tag "$TRIVYSCAN_REPO")"
-    if [ -z "$latest_trivyscan" ]; then
-        echo "[ERROR] Cannot fetch TrivyScan release info"
-        trivyscan_failed=true
-    elif ! $FORCE && [ "$current_trivyscan" = "$latest_trivyscan" ]; then
-        echo "[OK] TrivyScan already up to date (v$current_trivyscan)"
-    else
-        base="https://github.com/${TRIVYSCAN_REPO}/releases/download/v${latest_trivyscan}"
-        asset="trivyscan_${latest_trivyscan}_${OS_GO}_${ARCH_GO}.tar.gz"
-        sums="trivyscan_${latest_trivyscan}_checksums.txt"
-        extract_dir="$TMP_DIR/trivyscan"
+    printf '%s' "$path"
+}
 
-        echo "[INFO] Downloading from: $base/$asset"
-        if ! fetch "$base/$asset" "$TMP_DIR/$asset" || ! fetch "$base/$sums" "$TMP_DIR/$sums"; then
-            echo "[ERROR] Download failed"
-            trivyscan_failed=true
-        elif ! verify "$TMP_DIR/$asset" "$TMP_DIR/$sums" "$asset"; then
-            trivyscan_failed=true
-        else
-            mkdir -p "$extract_dir"
-            tar -xzf "$TMP_DIR/$asset" -C "$extract_dir"
-            if [ -f "$extract_dir/trivyscan" ]; then
-                source_bin="$extract_dir/trivyscan"
-            else
-                echo "[ERROR] trivyscan binary not found in $asset"
-                trivyscan_failed=true
+resolve_existing_trivy() {
+    local path=""
+    if [ -x "$BIN_DIR/trivy" ]; then
+        path="$BIN_DIR/trivy"
+    elif command -v trivy >/dev/null 2>&1; then
+        path="$(command -v trivy)"
+    fi
+    printf '%s' "$path"
+}
+
+main() {
+    parse_args "$@"
+    if [ "$TRIVYSCAN_VERSION" = "latest" ]; then TRIVYSCAN_VERSION=""; fi
+    if [ "$TRIVY_VERSION" = "latest" ]; then TRIVY_VERSION=""; fi
+    check_dependencies
+    setup_paths
+
+    if [ "$UNINSTALL" = true ]; then
+        do_uninstall
+        return 0
+    fi
+
+    detect_os_arch
+    log_info "OS: $(uname -s) | Arch: $ARCH_GO | Prefix: $PREFIX"
+
+    local current_trivyscan_path current_trivyscan_version
+    current_trivyscan_path="$(resolve_existing_trivyscan)"
+    current_trivyscan_version=""
+    if [ -n "$current_trivyscan_path" ]; then
+        current_trivyscan_version="$(get_binary_version "$current_trivyscan_path")"
+    fi
+
+    if [ -n "$current_trivyscan_path" ] && [ "$current_trivyscan_path" != "$BIN_DIR/trivyscan" ]; then
+        die "Unmanaged TrivyScan found at $current_trivyscan_path; remove it or use --system"
+    fi
+
+    local source_bin="" local_version=""
+    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        for name in trivyscan "trivyscan_${OS_GO}"; do
+            if [ -f "$script_dir/$name" ]; then
+                source_bin="$script_dir/$name"
+                break
             fi
+        done
+    fi
+    if [ -n "$source_bin" ]; then
+        local_version="$(get_binary_version "$source_bin")"
+        [ -n "$local_version" ] || die "Cannot read version from $source_bin"
+    fi
+
+    local desired_trivyscan explicit_trivyscan=false
+    if [ -n "$TRIVYSCAN_VERSION" ]; then
+        desired_trivyscan="$(normalize_version "$TRIVYSCAN_VERSION")"
+        explicit_trivyscan=true
+        if [ -n "$source_bin" ] && [ "$local_version" != "$desired_trivyscan" ]; then
+            die "Local binary is v$local_version but --trivyscan-version is v$desired_trivyscan"
+        fi
+    elif [ -n "$source_bin" ]; then
+        desired_trivyscan="$local_version"
+    else
+        desired_trivyscan="$(latest_tag "$REPO" || true)"
+        if [ -z "$desired_trivyscan" ] && [ -n "$current_trivyscan_version" ]; then
+            desired_trivyscan="$current_trivyscan_version"
+            log_warn "Cannot resolve latest TrivyScan; keeping v$desired_trivyscan"
+        fi
+        [ -n "$desired_trivyscan" ] || die "Cannot resolve the latest TrivyScan release"
+    fi
+    if [ -n "$source_bin" ]; then
+        desired_trivyscan="$local_version"
+    fi
+
+    local install_trivyscan=true
+    if [ "$FORCE" = false ] && [ -n "$current_trivyscan_version" ]; then
+        if [ "$current_trivyscan_version" = "$desired_trivyscan" ]; then
+            install_trivyscan=false
+        elif [ "$explicit_trivyscan" = false ] && version_lt "$desired_trivyscan" "$current_trivyscan_version"; then
+            install_trivyscan=false
+            log_warn "Installed TrivyScan v$current_trivyscan_version is newer than v$desired_trivyscan; keeping it"
         fi
     fi
-fi
 
-if [ -n "$source_bin" ]; then
-    run_privileged install -m 755 "$source_bin" "$TRIVYSCAN_INSTALL_DIR/trivyscan"
-    if [ -x "$TRIVYSCAN_INSTALL_DIR/trivyscan" ]; then
-        echo "[OK] TrivyScan installed"
-        trivyscan_updated=true
-    else
-        echo "[ERROR] Failed to install TrivyScan"
-        trivyscan_failed=true
-    fi
-fi
-
-# =========================================
-# Step 3: Update PATH
-# =========================================
-echo ""
-echo "[INFO] Checking PATH..."
-
-for dir in "$TRIVY_INSTALL_DIR" "$TRIVYSCAN_INSTALL_DIR"; do
-    if echo ":$PATH:" | grep -q ":$dir:"; then
-        echo "[OK] $dir already in PATH"
-    else
-        echo "[WARN] $dir is not in PATH"
-        if [ -n "$ZSH_VERSION" ]; then
-            echo "export PATH=\"\$PATH:$dir\"" >> "$HOME/.zshrc"
-            echo "[OK] Added to ~/.zshrc"
-        elif [ -n "$BASH_VERSION" ]; then
-            echo "export PATH=\"\$PATH:$dir\"" >> "$HOME/.bashrc"
-            echo "[OK] Added to ~/.bashrc"
+    if [ "$install_trivyscan" = true ]; then
+        if [ -z "$source_bin" ]; then
+            local asset="trivyscan_${desired_trivyscan}_${OS_GO}_${ARCH_GO}.tar.gz"
+            local sums="trivyscan_${desired_trivyscan}_checksums.txt"
+            download_verified "$REPO" "$desired_trivyscan" "$asset" "$sums" "$TMP_DIR/trivyscan"
+            source_bin="$(extract_binary "$DL_ARCHIVE" "$TMP_DIR/trivyscan/extract" trivyscan)" || \
+                die "trivyscan binary not found in $asset"
         else
-            echo "[INFO] Add manually: export PATH=\"\$PATH:$dir\""
+            log_info "Using local binary: $source_bin"
+        fi
+        install_binary "$source_bin" "$BIN_DIR/trivyscan" "$desired_trivyscan" || \
+            die "Failed to install TrivyScan"
+        TRIVYSCAN_ACTION="updated to v$desired_trivyscan"
+        TRIVYSCAN_INSTALLED_VERSION="$desired_trivyscan"
+    else
+        TRIVYSCAN_ACTION="kept v$current_trivyscan_version"
+        TRIVYSCAN_INSTALLED_VERSION="$current_trivyscan_version"
+        log_info "TrivyScan already at v$current_trivyscan_version"
+        if [ -n "$current_trivyscan_path" ]; then
+            desired_trivyscan="$current_trivyscan_version"
         fi
     fi
-done
 
-# =========================================
-# Step 4: Verify
-# =========================================
-echo ""
-echo "[INFO] Verifying..."
+    local current_trivy_path current_trivy_version
+    current_trivy_path="$(resolve_existing_trivy)"
+    current_trivy_version=""
+    if [ -n "$current_trivy_path" ]; then
+        current_trivy_version="$(get_binary_version "$current_trivy_path")"
+    fi
 
-command -v trivy    &>/dev/null && trivy --version
-command -v trivyscan &>/dev/null && trivyscan --version
+    local desired_trivy explicit_trivy=false
+    if [ -n "$TRIVY_VERSION" ]; then
+        desired_trivy="$(normalize_version "$TRIVY_VERSION")"
+        explicit_trivy=true
+    else
+        desired_trivy="$(latest_tag "$TRIVY_REPO" || true)"
+        if [ -z "$desired_trivy" ] && [ -n "$current_trivy_version" ]; then
+            desired_trivy="$current_trivy_version"
+            log_warn "Cannot resolve latest Trivy; keeping v$desired_trivy"
+        fi
+        [ -n "$desired_trivy" ] || die "Cannot resolve the latest Trivy release"
+    fi
 
-# =========================================
-# Summary
-# =========================================
-echo ""
-echo "========================================="
-if [ -z "$latest_trivy" ]; then
-    echo "[--] Trivy     -> skipped (cannot fetch version)"
-elif $trivy_updated; then
-    echo "[OK] Trivy     -> installed/updated to v$latest_trivy"
-elif [ -n "$current_trivy" ]; then
-    echo "[OK] Trivy     -> already up to date (v$current_trivy)"
-else
-    echo "[--] Trivy     -> install failed"
-fi
+    local install_trivy=true
+    if [ "$FORCE" = false ] && [ -n "$current_trivy_path" ]; then
+        if [ -n "$current_trivy_version" ] && [ "$current_trivy_version" = "$desired_trivy" ]; then
+            install_trivy=false
+        elif [ "$explicit_trivy" = false ] && [ -n "$current_trivy_version" ] && \
+             version_lt "$desired_trivy" "$current_trivy_version"; then
+            install_trivy=false
+            log_warn "Installed Trivy v$current_trivy_version is newer than v$desired_trivy; keeping it"
+        fi
+    fi
 
-if $trivyscan_failed; then
-    echo "[--] TrivyScan -> install failed"
-elif $trivyscan_updated; then
-    echo "[OK] TrivyScan -> installed/updated"
-else
-    echo "[OK] TrivyScan -> already installed"
-fi
+    if [ "$install_trivy" = true ]; then
+        local asset="trivy_${desired_trivy}_${OS_TRIVY}-${ARCH_TRIVY}.tar.gz"
+        local sums="trivy_${desired_trivy}_checksums.txt"
+        download_verified "$TRIVY_REPO" "$desired_trivy" "$asset" "$sums" "$TMP_DIR/trivy"
+        local trivy_src
+        trivy_src="$(extract_binary "$DL_ARCHIVE" "$TMP_DIR/trivy/extract" trivy)" || \
+            die "trivy binary not found in $asset"
+        install_binary "$trivy_src" "$BIN_DIR/trivy" "$desired_trivy" || \
+            die "Failed to install Trivy"
+        TRIVY_ACTION="updated to v$desired_trivy"
+        TRIVY_INSTALLED_VERSION="$desired_trivy"
+        TRIVY_MANAGED=1
+        TRIVY_BIN_PATH="$BIN_DIR/trivy"
+    else
+        TRIVY_ACTION="kept v$current_trivy_version"
+        TRIVY_INSTALLED_VERSION="$current_trivy_version"
+        if [ "$current_trivy_path" = "$BIN_DIR/trivy" ]; then
+            TRIVY_MANAGED=1
+        else
+            TRIVY_MANAGED=0
+        fi
+        TRIVY_BIN_PATH="$current_trivy_path"
+        log_info "Using existing Trivy v$current_trivy_version at $current_trivy_path"
+    fi
 
-echo "========================================="
-echo " Install complete! Run: source ~/.bashrc (or ~/.zshrc)"
-echo "========================================="
+    if [ -z "$TRIVY_BIN_PATH" ] || [ ! -x "$TRIVY_BIN_PATH" ]; then
+        die "Trivy is not available after setup"
+    fi
 
-if $trivyscan_failed; then
-    exit 1
-fi
+    if version_lt "$TRIVY_INSTALLED_VERSION" "$TRIVY_MIN_VERSION"; then
+        log_warn "Trivy v$TRIVY_INSTALLED_VERSION is older than the tested minimum v$TRIVY_MIN_VERSION"
+    fi
+
+    configure_path
+    write_manifest "$TRIVYSCAN_INSTALLED_VERSION" "$TRIVY_INSTALLED_VERSION"
+    run_db_update
+
+    echo ""
+    echo "========================================="
+    echo "      TrivyScan installer summary"
+    echo "========================================="
+    printf '[OK] TrivyScan  -> %s\n' "$TRIVYSCAN_ACTION"
+    printf '[OK] Trivy      -> %s\n' "$TRIVY_ACTION"
+    printf '[OK] Binaries   -> %s\n' "$BIN_DIR"
+    printf '[%s] Database  -> %s\n' "$([ "$DB_FAILED" -eq 1 ] && printf 'WARN' || printf 'OK')" "$DB_RESULT"
+    if [ "$PATH_MODIFIED" = "1" ] && [ -n "$PATH_FILE" ]; then
+        printf '[OK] PATH       -> added in %s (open a new terminal)\n' "$PATH_FILE"
+    fi
+    echo "========================================="
+
+    if [ "$DB_FAILED" -eq 1 ] && [ "$STRICT" = "1" ]; then
+        exit 1
+    fi
+    return 0
+}
+
+main "$@"

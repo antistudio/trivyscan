@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -594,6 +595,43 @@ func TestReadTargetListRelativeToFile(t *testing.T) {
 	want := []string{filepath.Join(dir, "img.tar"), "nginx:latest", "missing.tar"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("readTargetList = %q, want %q", got, want)
+	}
+}
+
+func TestResolveTrivy(t *testing.T) {
+	name := "trivy"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+
+	siblingDir := t.TempDir()
+	sibling := filepath.Join(siblingDir, name)
+	if err := os.WriteFile(sibling, []byte("stub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveTrivy("/custom/trivy", siblingDir); got != "/custom/trivy" {
+		t.Errorf("override = %q, want /custom/trivy", got)
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	if got := resolveTrivy("", siblingDir); got != sibling {
+		t.Errorf("sibling fallback = %q, want %q", got, sibling)
+	}
+
+	pathDir := t.TempDir()
+	pathTrivy := filepath.Join(pathDir, name)
+	if err := os.WriteFile(pathTrivy, []byte("stub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", pathDir)
+	if got := resolveTrivy("", siblingDir); got != pathTrivy {
+		t.Errorf("PATH lookup = %q, want %q", got, pathTrivy)
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	if got := resolveTrivy("", t.TempDir()); got != "trivy" {
+		t.Errorf("fallback = %q, want trivy", got)
 	}
 }
 

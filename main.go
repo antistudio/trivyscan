@@ -38,7 +38,6 @@ var version = "dev"
 var templateContent string
 
 const (
-	trivyCmd            = "trivy"
 	trivySubCmd         = "image"
 	trivyDownloadDB     = "--download-db-only"
 	trivyDownloadJavaDB = "--download-java-db-only"
@@ -293,7 +292,7 @@ func processScan(ctx context.Context, target scanTarget, jsonPath, scanner strin
 
 // runTrivy executes trivy and publishes the report atomically on success.
 func runTrivy(scanCtx context.Context, args []string, tmpFile, jsonPath string, timeout time.Duration) error {
-	out, err := runCommand(scanCtx, trivyCmd, args...)
+	out, err := runCommand(scanCtx, trivyBinary(), args...)
 	if err != nil {
 		msg := trivyErrorMessage(out)
 		if scanCtx.Err() == context.DeadlineExceeded || strings.Contains(msg, "context deadline exceeded") {
@@ -357,9 +356,42 @@ func (t scanTarget) kindString() string {
 // Trivy setup
 // ---------------------------------------------------------------------------
 
+// trivyBinary resolves Trivy dynamically. TRIVY_BIN is an explicit override;
+// otherwise `which trivy` (exec.LookPath) wins, then a sibling next to
+// trivyscan, then plain "trivy" so PATH lookup remains the default.
+func trivyBinary() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return resolveTrivy(os.Getenv("TRIVY_BIN"), "")
+	}
+	return resolveTrivy(os.Getenv("TRIVY_BIN"), filepath.Dir(exe))
+}
+
+func resolveTrivy(override, exeDir string) string {
+	if override != "" {
+		return override
+	}
+	if path, err := exec.LookPath("trivy"); err == nil {
+		return path
+	}
+	if exeDir != "" {
+		name := "trivy"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		candidate := filepath.Join(exeDir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return "trivy"
+}
+
 func checkTrivyInstalled(ctx context.Context) error {
+	trivyPath := trivyBinary()
 	log.Info().Msg("Checking Trivy...")
-	output, err := runCommand(ctx, trivyCmd, "--version")
+	log.Debug().Str("path", trivyPath).Msg("Resolved Trivy")
+	output, err := runCommand(ctx, trivyPath, "--version")
 	if err != nil {
 		return buildTrivyNotFoundError()
 	}
@@ -387,7 +419,8 @@ func versionLess(a, b string) bool {
 
 func buildTrivyNotFoundError() error {
 	var sb strings.Builder
-	sb.WriteString("Trivy not found in PATH.\n\n")
+	sb.WriteString("Trivy not found.\n\n")
+	sb.WriteString("Looked for $TRIVY_BIN, PATH (which trivy), then a sibling next to trivyscan.\n\n")
 	switch runtime.GOOS {
 	case "windows":
 		sb.WriteString("  Run: install.ps1\n\n")
@@ -410,7 +443,7 @@ func updateTrivyDB(ctx context.Context) error {
 		default:
 		}
 		log.Info().Str("database", db.name).Msg("Downloading...")
-		output, err := runCommand(ctx, trivyCmd, trivySubCmd, db.flag)
+		output, err := runCommand(ctx, trivyBinary(), trivySubCmd, db.flag)
 		if err != nil {
 			log.Error().Str("database", db.name).Msgf("Update failed: %s", output)
 			return fmt.Errorf("%s db failed: %w", db.name, err)

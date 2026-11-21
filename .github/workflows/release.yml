@@ -18,6 +18,8 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,3 +53,56 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  smoke-install:
+    needs: goreleaser
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install release via installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.goreleaser.outputs.version }}"
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/bin"
+          printf '#!/bin/sh\necho "Version: 999.0.0"\n' > "$tmp/bin/trivy"
+          chmod +x "$tmp/bin/trivy"
+          curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh -o "$tmp/install.sh"
+          PATH="$tmp/bin:$PATH" TRIVYSCAN_VERSION="$VERSION" bash "$tmp/install.sh" \
+            --prefix "$tmp/prefix" --skip-db-update --no-modify-path
+          "$tmp/prefix/bin/trivyscan" --version
+          bash "$tmp/install.sh" --prefix "$tmp/prefix" --uninstall --no-modify-path
+          test ! -e "$tmp/prefix/bin/trivyscan"
+
+  smoke-install-windows:
+    needs: goreleaser
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - name: Install release via installer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ needs.goreleaser.outputs.version }}"
+          $tmp = Join-Path $env:RUNNER_TEMP "trivyscan-release-smoke"
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          $bin = Join-Path $tmp "bin"
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+          Set-Content -Path (Join-Path $bin "trivy.cmd") -Value "@echo Version: 999.0.0"
+          $env:Path = "$bin;$env:Path"
+          irm https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.ps1 `
+            -OutFile (Join-Path $tmp "install.ps1")
+          $prefix = Join-Path $tmp "prefix"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tmp "install.ps1") `
+            -TrivyScanVersion $version -InstallDir $prefix -SkipDbUpdate -NoPath -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $prefix "trivyscan.exe") --version
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tmp "install.ps1") `
+            -InstallDir $prefix -Uninstall -NoPath -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Test-Path (Join-Path $prefix "trivyscan.exe")) { throw "trivyscan still present" }
