@@ -66,6 +66,9 @@ archives:
       - src: scripts/install.ps1
         dst: .
         strip_parent: true
+      - src: scripts/allow-windows.ps1
+        dst: .
+        strip_parent: true
 
 snapshot:
   version_template: "dev"

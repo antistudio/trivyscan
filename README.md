@@ -29,23 +29,27 @@ go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o tri
 
 > **Note:** Without `-ldflags`, `trivyscan -v` will show `dev`. The version is injected at build time via linker flags.
 
-#### Windows (one-liner)
-
-Open PowerShell as **Administrator** and run:
+#### Windows (per-user, no admin)
 
 ```powershell
 irm https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.ps1 | iex
 ```
 
-This downloads the latest release, installs Trivy + TrivyScan to `C:\Program Files\`, and adds both to `PATH`.
+Installs Trivy + TrivyScan to `%LOCALAPPDATA%\Programs\TrivyScan`, updates the User PATH,
+checks for a newer release, and runs `trivyscan -u`. Use `-System` from a downloaded file for
+a machine-wide install.
 
-#### Linux / macOS
+#### Linux / macOS (per-user, no sudo)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/antistudio/trivyscan/main/scripts/install.sh | bash
 ```
 
-For manual installation and more details, see [INSTALL.md](INSTALL.md).
+Installs to `~/.local/bin`, checks for a newer release, updates PATH idempotently, and runs
+`trivyscan -u`. Use `--system` with sudo for `/usr/local`.
+
+For system-wide installs, flags, version pinning, Windows Application Control, and uninstall,
+see [INSTALL.md](INSTALL.md).
 
 ## Quick Start
 

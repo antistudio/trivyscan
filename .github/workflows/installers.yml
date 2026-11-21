@@ -1,0 +1,135 @@
+name: Installers
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n scripts/install.sh
+      - name: ShellCheck errors
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/install.sh
+
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse scripts
+        shell: powershell
+        run: |
+          $files = @("scripts/install.ps1", "scripts/allow-windows.ps1")
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_ }
+              exit 1
+            }
+          }
+      - name: Parse scripts with PowerShell 7
+        shell: pwsh
+        run: |
+          $files = @("scripts/install.ps1", "scripts/allow-windows.ps1")
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_ }
+              exit 1
+            }
+          }
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -ErrorAction SilentlyContinue
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $issues = @()
+          foreach ($file in @("scripts/install.ps1", "scripts/allow-windows.ps1")) {
+            $issues += @(Invoke-ScriptAnalyzer -Path $file -Severity Error)
+          }
+          if ($issues.Count -gt 0) {
+            $issues | Format-Table -AutoSize | Out-String | Write-Host
+            exit 1
+          }
+
+  smoke-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - name: Install and uninstall local build
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/bin"
+          printf '#!/bin/sh\necho "Version: 999.0.0"\n' > "$tmp/bin/trivy"
+          chmod +x "$tmp/bin/trivy"
+          go build -ldflags "-X main.version=1.3.0" -o "$tmp/trivyscan" .
+          cp scripts/install.sh "$tmp/install.sh"
+          PATH="$tmp/bin:$PATH" bash "$tmp/install.sh" \
+            --prefix "$tmp/prefix" --skip-db-update --no-modify-path
+          "$tmp/prefix/bin/trivyscan" --version
+          test -f "$tmp/prefix/share/trivyscan/install.env"
+          bash "$tmp/install.sh" --prefix "$tmp/prefix" --uninstall --no-modify-path
+          test ! -e "$tmp/prefix/bin/trivyscan"
+
+  smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - name: Install and uninstall local build
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tmp = Join-Path $env:RUNNER_TEMP "trivyscan-smoke"
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          $bin = Join-Path $tmp "bin"
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+          Set-Content -Path (Join-Path $bin "trivy.cmd") -Value "@echo Version: 999.0.0"
+          $env:Path = "$bin;$env:Path"
+          go build -ldflags "-X main.version=1.3.0" -o (Join-Path $tmp "trivyscan.exe") .
+          Copy-Item scripts/install.ps1 (Join-Path $tmp "install.ps1")
+          $prefix = Join-Path $tmp "prefix"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tmp "install.ps1") `
+            -InstallDir $prefix -SkipDbUpdate -NoPath -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $prefix "trivyscan.exe") --version
+          if (-not (Test-Path (Join-Path $prefix "install.json"))) { throw "manifest missing" }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/allow-windows.ps1 `
+            -InstallDir $prefix -DiagnoseOnly -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tmp "install.ps1") `
+            -InstallDir $prefix -Uninstall -NoPath -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Test-Path (Join-Path $prefix "trivyscan.exe")) { throw "trivyscan still present" }
+
+      - name: Diagnose Application Control
+        shell: powershell
+        run: |
+          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/allow-windows.ps1 `
+            -DiagnoseOnly -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
