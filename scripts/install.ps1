@@ -227,6 +227,14 @@ function Compare-Version {
     }
 }
 
+function Get-ActionLabel {
+    param([bool]$Installed, [string]$From, [string]$To)
+    if (-not $Installed) { return "v$To" }
+    if (-not $From) { return "INSTALL v$To" }
+    if ($From -eq $To) { return "REINSTALL v$To" }
+    return "UPDATE v$From -> v$To"
+}
+
 function Test-Checksum {
     param([string]$File, [string]$SumsFile, [string]$Name)
     $expected = ""
@@ -1188,12 +1196,17 @@ function Invoke-Main {
 
     Invoke-DatabaseUpdate -Paths $paths -TrivyPath $trivyPath
 
+    $trivyScanFrom = if ($existingTrivyScan -and $existingTrivyScan.Version -ne "BLOCKED") { $existingTrivyScan.Version } else { "" }
+    $trivyFrom = if ($existingTrivy -and $existingTrivy.Version -ne "BLOCKED") { $existingTrivy.Version } else { "" }
+    $trivyScanLabel = Get-ActionLabel -Installed $installTrivyScan -From $trivyScanFrom -To $trivyScanInstalled.Version
+    $trivyLabel = Get-ActionLabel -Installed $installTrivy -From $trivyFrom -To $trivyVersionInstalled
+
     Write-Host ""
     Write-Host "========================================="
     Write-Host "      TrivyScan installer summary"
     Write-Host "========================================="
-    Write-Host "[OK] TrivyScan  -> v$($trivyScanInstalled.Version) at $($paths.TrivyScan)"
-    Write-Host "[OK] Trivy      -> v$trivyVersionInstalled at $trivyPath"
+    Write-Host "[OK] TrivyScan  -> $trivyScanLabel at $($paths.TrivyScan)"
+    Write-Host "[OK] Trivy      -> $trivyLabel at $trivyPath"
     if ($script:DbFailed) {
         Write-Warn "Database -> update failed; run trivyscan -u later"
     } elseif ($script:DbSkipped) {
