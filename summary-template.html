@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trivy Security Summary</title>
+  <style>{{ .CSS }}</style>
+  <style>
+    /* ══ SUMMARY ONLY (shared styles come from trivy-template.html) ══ */
+    .num { text-align: center; white-space: nowrap; }
+    .count-zero { font-family: var(--mono); color: var(--tx2); opacity: .5; }
+    .count-total { font-family: var(--mono); font-weight: 700; color: var(--tx3); }
+    .digest { display: block; margin-top: 4px; font-size: 12px; }
+    tfoot td { font-weight: 700; background: var(--bg3); border-top: 1px solid var(--bd); }
+    .row-error { display: block; margin-top: 4px; font-family: var(--mono); font-size: 12px; color: var(--critical); white-space: normal; }
+    tbody tr.row-previous td { opacity: .6; }
+    .card.failed { border-left: 3px solid var(--critical); }
+    .card.failed .card-value { color: var(--critical); }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <!-- ══ HEADER ═══════════════════════════════════════ -->
+  <div class="header">
+    <div class="logo">TRIVY SCAN<span> //</span></div>
+    <div class="header-right">
+      <strong style="color:var(--ac)">SUMMARY</strong>
+      &nbsp;·&nbsp;
+      {{ len .Rows }} images
+      &nbsp;·&nbsp;
+      {{ .Generated }}
+    </div>
+  </div>
+
+  <!-- ══ SUMMARY CARDS ════════════════════════════════ -->
+  <div class="meta-grid">
+    <div class="card total">
+      <div class="card-label">Total</div>
+      <div class="card-value">{{ .Total }}</div>
+    </div>
+    {{- if .Failed }}
+    <div class="card failed">
+      <div class="card-label">Failed</div>
+      <div class="card-value">{{ .Failed }}</div>
+    </div>
+    {{- end }}
+    {{- range .Severities }}
+    {{- if ne . "UNKNOWN" }}
+    <div class="card {{ lower . }}">
+      <div class="card-label">{{ title . }}</div>
+      <div class="card-value">{{ index $.Totals . }}</div>
+    </div>
+    {{- end }}
+    {{- end }}
+  </div>
+
+  <!-- ══ IMAGES ═══════════════════════════════════════ -->
+  <div class="section">
+    <div class="section-header">
+      <div class="section-title-left">
+        <span class="section-type">Images</span>
+      </div>
+    </div>
+
+    <div class="section-content">
+      {{- if not .Rows }}
+      <div class="no-vulns">
+        <div class="no-vulns-icon">✓</div>
+        <div class="no-vulns-title">No Reports Found</div>
+        <div style="margin-top: 4px;">No scan results are available yet.</div>
+      </div>
+      {{- else }}
+      <div class="table-wrapper">
+        <table>
+          <thead>
+          <tr>
+            <th scope="col">Image</th>
+            <th scope="col">Status</th>
+            <th scope="col">OS</th>
+            {{- range .Severities }}
+            <th scope="col" class="num">{{ title . }}</th>
+            {{- end }}
+            <th scope="col" class="num">Total</th>
+            <th scope="col">Scanned</th>
+            <th scope="col">Detail</th>
+          </tr>
+          </thead>
+          <tbody>
+          {{- range .Rows }}
+          {{- $row := . }}
+          {{- $scanned := or (eq .Status "ok") (eq .Status "previous") }}
+          <tr class="{{ if .Highest }}severity-{{ .Highest }}{{ end }}{{ if eq .Status "previous" }} row-previous{{ end }}">
+            <td>
+              <span class="package-name">{{ .Label }}</span>
+              {{- if .Digest }}
+              <span class="version digest">{{ .Digest }}</span>
+              {{- end }}
+              {{- if .Error }}
+              <span class="row-error">{{ .Error }}</span>
+              {{- end }}
+            </td>
+            <td>
+              {{- if eq .Status "failed" }}<span class="severity-badge CRITICAL">Failed</span>
+              {{- else if eq .Status "skipped" }}<span class="severity-badge UNKNOWN">Skipped</span>
+              {{- else if eq .Status "previous" }}<span class="version">Previous run</span>
+              {{- else }}<span class="version version-fixed">OK</span>{{ end -}}
+            </td>
+            <td><span class="version">{{ .OS }}</span></td>
+            {{- range $.Severities }}
+            {{- $n := index $row.Counts . }}
+            <td class="num">
+              {{- if not $scanned }}<span class="count-zero">-</span>
+              {{- else if $n }}<span class="severity-badge {{ . }}">{{ $n }}</span>
+              {{- else }}<span class="count-zero">0</span>{{ end -}}
+            </td>
+            {{- end }}
+            <td class="num">{{ if $scanned }}<span class="count-total">{{ .Total }}</span>{{ else }}<span class="count-zero">-</span>{{ end }}</td>
+            <td><span class="version-empty">{{ .Scanned }}</span></td>
+            <td>{{ if .Href }}<a href="{{ .Href }}" class="ref-link">View report</a>{{ else }}<span class="count-zero">-</span>{{ end }}</td>
+          </tr>
+          {{- end }}
+          </tbody>
+          <tfoot>
+          <tr>
+            <td colspan="3">Total</td>
+            {{- range .Severities }}
+            <td class="num">{{ index $.Totals . }}</td>
+            {{- end }}
+            <td class="num">{{ .Total }}</td>
+            <td colspan="2"></td>
+          </tr>
+          </tfoot>
+        </table>
+      </div>
+      {{- end }}
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

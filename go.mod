@@ -1,4 +1,4 @@
-module github.com/anhnmt/trivyscan
+module github.com/antistudio/trivyscan
 
 go 1.26
 
