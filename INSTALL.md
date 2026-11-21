@@ -169,26 +169,23 @@ An Application Control policy has blocked this file
 
 means Windows (WDAC / AppLocker / Smart App Control) blocked the executable, not a TrivyScan bug.
 
-Diagnose:
+Application Control handling is built into `install.ps1`:
 
 ```powershell
-.\allow-windows.ps1 -DiagnoseOnly
-```
+# Only diagnose; do not install
+.\install.ps1 -DiagnoseOnly
 
-The allow script is included in the repository and release archive:
+# Default: install, then auto-apply AppLocker hash rules if local AppLocker is blocking and you are admin
+.\install.ps1
 
-```powershell
-# Preview only
-.\allow-windows.ps1 -WhatIf
-
-# Default: auto-apply AppLocker hash rules if local AppLocker is blocking and you are admin
-.\allow-windows.ps1
+# Install, but preview AppLocker policy changes only
+.\install.ps1 -WhatIf
 
 # Explicit modes
-.\allow-windows.ps1 -AppLockerHash
-.\allow-windows.ps1 -AppLockerPath
-.\allow-windows.ps1 -WdacDraft -BasePolicyPath .\Base.xml -SigningCertPath .\codesign.cer
-.\allow-windows.ps1 -Unblock
+.\install.ps1 -AppLockerHash
+.\install.ps1 -AppLockerPath
+.\install.ps1 -WdacDraft -BasePolicyPath .\Base.xml -SigningCertPath .\codesign.cer
+.\install.ps1 -Unblock
 ```
 
 Behavior:

@@ -12,6 +12,7 @@
 # The installer checks the latest release on every run, updates older versions,
 # keeps newer versions unless -Force/-TrivyScanVersion/-TrivyVersion is used,
 # and runs `trivyscan -u` after a successful install.
+# Windows Application Control diagnosis/allow is built in; use -DiagnoseOnly.
 
 param(
     [switch]$System,
@@ -26,7 +27,18 @@ param(
     [switch]$Purge,
     [switch]$NoPause,
     [switch]$NonInteractive,
-    [switch]$Help
+    [switch]$Help,
+    [switch]$DiagnoseOnly,
+    [switch]$AppLockerHash,
+    [switch]$AppLockerPath,
+    [switch]$WdacDraft,
+    [switch]$Deploy,
+    [switch]$Unblock,
+    [string]$User = "Everyone",
+    [string]$BasePolicyPath = "",
+    [string]$BasePolicyId = "",
+    [string]$SigningCertPath = "",
+    [switch]$WhatIf
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,8 +57,14 @@ $script:TempDir = ""
 $script:DbFailed = $false
 $script:DbSkipped = $false
 $script:ExitCode = 0
+$script:AppControlBlocked = $false
+$script:AppControlStatus = ""
+$script:Applied = @()
+$script:BackupPath = ""
+$script:Mechanism = "unknown"
 
 function Write-Info { param([string]$Message) Write-Host "[INFO] $Message" -ForegroundColor Cyan }
+function Write-Ok   { param([string]$Message) Write-Host "[OK] $Message" -ForegroundColor Green }
 function Write-Warn { param([string]$Message) Write-Host "[WARN] $Message" -ForegroundColor Yellow }
 function Write-Err  { param([string]$Message) Write-Host "[ERROR] $Message" -ForegroundColor Red }
 
@@ -68,6 +86,19 @@ Options:
   -NoPause                 Do not wait for Enter at the end
   -NonInteractive          No pause; return an exit code for automation
   -Help                    Show this help
+
+Application Control:
+  -DiagnoseOnly            Only diagnose SAC/AppLocker/WDAC; no install
+  -AppLockerHash           Apply local AppLocker hash allow rules
+  -AppLockerPath           Apply local AppLocker path allow rules
+  -WdacDraft               Generate a WDAC supplemental policy draft
+  -Deploy                  With -WdacDraft, deploy via CiTool
+  -Unblock                 Remove Mark-of-the-Web from installed binaries
+  -User USER               AppLocker rule target (default: Everyone)
+  -BasePolicyPath PATH     Base WDAC policy XML for supplemental draft
+  -BasePolicyId GUID       Base WDAC policy ID for supplemental draft
+  -SigningCertPath PATH    Certificate used to sign the WDAC draft
+  -WhatIf                  Preview Application Control changes
 '@ | Write-Host
 }
 
@@ -267,7 +298,8 @@ function Install-Binary {
         $got = Get-BinaryVersion -Path $Target
         if ($ExpectedVersion -and $got -ne $ExpectedVersion) {
             if ($got -eq "BLOCKED") {
-                Write-Warn "$Target is installed but blocked by Application Control; run allow-windows.ps1 -DiagnoseOnly"
+                $script:AppControlBlocked = $true
+                Write-Warn "$Target is installed but blocked by Application Control"
             } else {
                 throw "$Target reports '$got', expected '$ExpectedVersion'"
             }
@@ -411,6 +443,431 @@ function Get-ElevatedArguments {
     return $arguments
 }
 
+function Get-BinaryPaths {
+    param([string]$InstallDir)
+    $result = [pscustomobject]@{ TrivyScan = ""; Trivy = "" }
+    if ($InstallDir) {
+        $candidate = Join-Path $InstallDir "trivyscan.exe"
+        if (Test-Path -LiteralPath $candidate) { $result.TrivyScan = $candidate }
+        $candidate = Join-Path $InstallDir "trivy.exe"
+        if (Test-Path -LiteralPath $candidate) { $result.Trivy = $candidate }
+        return $result
+    }
+    $local = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\TrivyScan"
+    $machine = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "TrivyScan"
+    $machineTrivy = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "Trivy"
+
+    $cmd = Get-Command trivyscan -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { $result.TrivyScan = $cmd.Source }
+    if (-not $result.TrivyScan) {
+        foreach ($p in @((Join-Path $local "trivyscan.exe"), (Join-Path $machine "trivyscan.exe"))) {
+            if (Test-Path -LiteralPath $p) { $result.TrivyScan = $p; break }
+        }
+    }
+
+    $cmd = Get-Command trivy -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { $result.Trivy = $cmd.Source }
+    if (-not $result.Trivy) {
+        foreach ($p in @(
+            (Join-Path $local "trivy.exe"),
+            (Join-Path $machine "trivy.exe"),
+            (Join-Path $machineTrivy "trivy.exe")
+        )) {
+            if (Test-Path -LiteralPath $p) { $result.Trivy = $p; break }
+        }
+    }
+    if (-not $result.Trivy -and $result.TrivyScan) {
+        $sibling = Join-Path (Split-Path -Parent $result.TrivyScan) "trivy.exe"
+        if (Test-Path -LiteralPath $sibling) { $result.Trivy = $sibling }
+    }
+    return $result
+}
+
+function Get-SignatureState {
+    param([string[]]$Paths)
+    $out = @()
+    foreach ($path in $Paths) {
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            $sig = Get-AuthenticodeSignature -FilePath $path
+            $out += [pscustomobject]@{
+                Path   = $path
+                Status = $sig.Status.ToString()
+                Signer = $(if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" })
+            }
+        } catch {
+            $out += [pscustomobject]@{ Path = $path; Status = "Unknown"; Signer = "" }
+        }
+    }
+    return $out
+}
+
+function Get-CiPolicies {
+    if (-not $env:SystemRoot) { return @() }
+    $tool = Join-Path $env:SystemRoot "System32\CiTool.exe"
+    if (-not (Test-Path -LiteralPath $tool)) { return @() }
+    try {
+        $json = (& $tool -lp -json 2>$null | Out-String)
+        if (-not $json) { return @() }
+        $data = $json | ConvertFrom-Json
+        if ($data.Policies) { return @($data.Policies) }
+    } catch { }
+    return @()
+}
+
+function Get-CodeIntegrityEvents {
+    $events = @()
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = "Microsoft-Windows-CodeIntegrity/Operational"; Id = @(3076, 3077)
+        } -MaxEvents 20 -ErrorAction Stop)
+    } catch { }
+    return $events
+}
+
+function Get-AppLockerEvents {
+    $events = @()
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = "Microsoft-Windows-AppLocker/EXE and DLL"; Id = 8004
+        } -MaxEvents 20 -ErrorAction Stop)
+    } catch { }
+    return $events
+}
+
+function Get-SacState {
+    $state = $null
+    try {
+        $state = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" `
+            -Name "VerifiedAndReputablePolicyState" -ErrorAction Stop).VerifiedAndReputablePolicyState
+    } catch { }
+    return $state
+}
+
+function Get-AppLockerState {
+    $local = ""
+    $effective = ""
+    try { $local = Get-AppLockerPolicy -Local -Xml } catch { }
+    try { $effective = Get-AppLockerPolicy -Effective -Xml } catch { }
+    $domain = $false
+    if ($local -and $effective -and ($local -ne $effective)) { $domain = $true }
+    return [pscustomobject]@{ Local = $local; Effective = $effective; Domain = $domain }
+}
+
+function Test-AppLockerDenied {
+    param([string[]]$Paths, [string]$User)
+    if (-not $Paths -or -not $Paths.Count) { return $false }
+    try {
+        $policy = Get-AppLockerPolicy -Effective
+        $decisions = @(Test-AppLockerPolicy -PolicyObject $policy -Path $Paths -User $User -ErrorAction Stop)
+        foreach ($decision in $decisions) {
+            $text = ($decision | Format-List * | Out-String)
+            if ($text -match "Denied") { return $true }
+        }
+    } catch { }
+    return $false
+}
+
+function Start-AppIdService {
+    try {
+        $svc = Get-Service -Name AppIDSvc -ErrorAction Stop
+        if ($svc.Status -ne "Running") {
+            Start-Service -Name AppIDSvc -ErrorAction Stop
+            Write-Info "Started AppIDSvc"
+        }
+    } catch {
+        Write-Warn "AppIDSvc is not running; AppLocker rules may not take effect"
+    }
+}
+
+function New-AppLockerAllow {
+    param([string[]]$Paths, [string]$RuleType, [string]$User, [bool]$Preview)
+    if (-not (Test-Admin)) {
+        throw "AppLocker changes require an elevated PowerShell window"
+    }
+    $existing = @($Paths | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    if (-not $existing.Count) { throw "No installed TrivyScan/Trivy binaries found" }
+
+    $state = Get-AppLockerState
+    if ($state.Domain) {
+        throw "An AppLocker domain policy is active; ask IT to add a $RuleType rule for: $($existing -join ', ')"
+    }
+    if (-not $Preview) { Start-AppIdService }
+
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $newPolicy = Join-Path $env:TEMP "applocker-trivyscan-$stamp.xml"
+    if (-not $Preview) {
+        $script:BackupPath = Join-Path $env:TEMP "applocker-backup-$stamp.xml"
+        Write-Info "Backing up local AppLocker policy to $script:BackupPath"
+        Get-AppLockerPolicy -Local -Xml | Set-Content -LiteralPath $script:BackupPath -Encoding UTF8
+    }
+
+    $info = Get-AppLockerFileInformation -Path $existing
+    $xml = $info | New-AppLockerPolicy -RuleType $RuleType -User $User -Xml
+    if ($Preview) {
+        Write-Info "Would add AppLocker $RuleType allow rules for: $($existing -join ', ')"
+        return
+    }
+
+    $xml | Set-Content -LiteralPath $newPolicy -Encoding UTF8
+    Write-Info "Merging AppLocker $RuleType allow rules"
+    try {
+        Set-AppLockerPolicy -XmlPolicy $newPolicy -Merge
+    } catch {
+        Write-Warn "Merge failed; restoring AppLocker backup"
+        Set-AppLockerPolicy -XmlPolicy $script:BackupPath
+        throw
+    }
+
+    if (Test-AppLockerDenied -Paths $existing -User $User) {
+        Write-Warn "Verification still reports Denied; restoring AppLocker backup"
+        Set-AppLockerPolicy -XmlPolicy $script:BackupPath
+        throw "AppLocker rule did not take effect"
+    }
+
+    $script:Applied += "AppLocker $RuleType allow rules"
+    $script:AppControlStatus = "AppLocker $RuleType rules applied"
+    Write-Ok "AppLocker $RuleType allow rules applied"
+    Write-Info "Re-run this install after each TrivyScan/Trivy update for hash rules"
+}
+
+function New-WdacDraft {
+    param(
+        [string[]]$Paths,
+        [string]$BasePolicyPath,
+        [string]$BasePolicyId,
+        [string]$SigningCertPath,
+        [bool]$Deploy,
+        [bool]$Preview
+    )
+    foreach ($cmd in @("New-CIPolicyRule", "New-CIPolicy", "Set-CIPolicyIdInfo", "ConvertFrom-CIPolicy")) {
+        if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+            throw "ConfigCI cmdlet $cmd is unavailable; install the Windows ADK/ConfigCI module"
+        }
+    }
+    if (-not $BasePolicyPath -and -not $BasePolicyId) {
+        throw "Provide -BasePolicyPath or -BasePolicyId for the supplemental policy"
+    }
+
+    $existing = @($Paths | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    if (-not $existing.Count) { throw "No installed TrivyScan/Trivy binaries found" }
+    if ($Preview) {
+        Write-Info "Would create a WDAC supplemental draft for: $($existing -join ', ')"
+        return
+    }
+
+    $rules = @()
+    foreach ($path in $existing) {
+        $sig = Get-AuthenticodeSignature -FilePath $path
+        if ($sig.Status -eq "Valid") {
+            $rules += New-CIPolicyRule -DriverFilePath $path -Level FilePublisher -Fallback Hash
+        } else {
+            $rules += New-CIPolicyRule -DriverFilePath $path -Level Hash
+        }
+    }
+
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $xmlPath = Join-Path $env:TEMP "trivyscan-wdac-$stamp.xml"
+    $cipPath = Join-Path $env:TEMP "trivyscan-wdac-$stamp.cip"
+    New-CIPolicy -MultiplePolicyFormat -FilePath $xmlPath -Rules $rules
+    if ($BasePolicyPath) {
+        Set-CIPolicyIdInfo -FilePath $xmlPath -PolicyName "TrivyScan Allow" `
+            -BasePolicyToSupplementPath $BasePolicyPath
+    } else {
+        $guid = [guid]$BasePolicyId
+        Set-CIPolicyIdInfo -FilePath $xmlPath -PolicyName "TrivyScan Allow" `
+            -SupplementsBasePolicyID $guid
+    }
+    if ($SigningCertPath) {
+        Add-SignerRule -FilePath $xmlPath -CertificatePath $SigningCertPath -Update -Supplemental
+    }
+    ConvertFrom-CIPolicy -XmlFilePath $xmlPath -BinaryFilePath $cipPath
+    Write-Info "WDAC draft: $xmlPath"
+    Write-Info "WDAC binary: $cipPath"
+
+    if ($Deploy) {
+        if (-not (Test-Admin)) { throw "WDAC deployment requires an elevated PowerShell window" }
+        $tool = Join-Path $env:SystemRoot "System32\CiTool.exe"
+        if (-not (Test-Path -LiteralPath $tool)) { throw "CiTool.exe is unavailable" }
+        & $tool -up $cipPath
+        if ($LASTEXITCODE -ne 0) { throw "CiTool failed with exit code $LASTEXITCODE" }
+        $script:Applied += "WDAC supplemental policy"
+        $script:AppControlStatus = "WDAC supplemental policy deployed"
+        Write-Ok "WDAC supplemental policy deployed"
+    } else {
+        $script:AppControlStatus = "WDAC draft created"
+        Write-Warn "Draft only. Sign it per your WDAC process, then deploy with -Deploy or CiTool"
+    }
+}
+
+function Invoke-Unblock {
+    param([string[]]$Paths, [bool]$Preview)
+    foreach ($path in $Paths) {
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { continue }
+        if ($Preview) {
+            Write-Info "Would unblock $path"
+            continue
+        }
+        try {
+            Unblock-File -LiteralPath $path
+            Write-Ok "Unblocked $path"
+        } catch {
+            Write-Warn "Could not unblock $path"
+        }
+    }
+}
+
+function Show-Diagnosis {
+    param($Paths, $Signatures, $CiPolicies, $SacState, $AppLocker, $AppLockerDenied, $AppLockerEvents, $CodeIntegrityEvents)
+    Write-Host ""
+    Write-Host "========================================="
+    Write-Host "  Windows Application Control diagnosis"
+    Write-Host "========================================="
+    Write-Host "Binaries:"
+    if ($Paths.TrivyScan) { Write-Host "  TrivyScan: $($Paths.TrivyScan)" } else { Write-Host "  TrivyScan: not found" }
+    if ($Paths.Trivy)     { Write-Host "  Trivy:     $($Paths.Trivy)" } else { Write-Host "  Trivy:     not found" }
+
+    Write-Host "Authenticode:"
+    if (-not $Signatures.Count) { Write-Host "  no binaries to inspect" }
+    foreach ($sig in $Signatures) {
+        Write-Host "  $($sig.Status): $($sig.Path)"
+        if ($sig.Signer) { Write-Host "    $($sig.Signer)" }
+    }
+
+    Write-Host "Smart App Control:"
+    if ($null -ne $SacState) { Write-Host "  VerifiedAndReputablePolicyState = $SacState" } else { Write-Host "  state unavailable" }
+    $sacPolicy = @($CiPolicies | Where-Object { $_.FriendlyName -like "VerifiedAndReputableDesktop*" })
+    if ($sacPolicy.Count) {
+        foreach ($p in $sacPolicy) { Write-Host "  $($p.FriendlyName) enforced=$($p.IsEnforced)" }
+    } else {
+        Write-Host "  no Smart App Control policy listed"
+    }
+
+    Write-Host "AppLocker:"
+    Write-Host "  local policy: $(if ($AppLocker.Local) { 'present' } else { 'none' })"
+    Write-Host "  effective policy: $(if ($AppLocker.Effective) { 'present' } else { 'none' })"
+    Write-Host "  domain override: $($AppLocker.Domain)"
+    Write-Host "  denied by effective policy: $AppLockerDenied"
+    Write-Host "  recent block events: $($AppLockerEvents.Count)"
+
+    Write-Host "WDAC / App Control:"
+    $wdac = @($CiPolicies | Where-Object {
+        $_.FriendlyName -notlike "VerifiedAndReputableDesktop*" -and $_.IsSystemPolicy -eq $false
+    })
+    if ($wdac.Count) {
+        foreach ($p in $wdac) {
+            Write-Host "  $($p.FriendlyName) enforced=$($p.IsEnforced) system=$($p.IsSystemPolicy)"
+        }
+    } else {
+        Write-Host "  no organization WDAC policy listed"
+    }
+    Write-Host "  recent CodeIntegrity block/audit events: $($CodeIntegrityEvents.Count)"
+    Write-Host "========================================="
+}
+
+function Invoke-ApplicationControlAllow {
+    param($Paths, [bool]$DiagnoseOnlyMode, [bool]$ForceRun, [bool]$Blocked)
+    $exes = @($Paths.TrivyScan, $Paths.Trivy) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    $shouldRun = $DiagnoseOnlyMode -or $ForceRun -or $Blocked -or $AppLockerHash -or $AppLockerPath -or $WdacDraft -or $Unblock -or $WhatIf
+    if (-not $shouldRun) { return }
+
+    $signatures = @(Get-SignatureState -Paths $exes)
+    $ciPolicies = @(Get-CiPolicies)
+    $sacState = Get-SacState
+    $appLocker = Get-AppLockerState
+    $appLockerDenied = Test-AppLockerDenied -Paths $exes -User $User
+    $appLockerEvents = @(Get-AppLockerEvents | Where-Object { $_.Message -match "(?i)trivyscan|trivy" })
+    $codeIntegrityEvents = @(Get-CodeIntegrityEvents | Where-Object { $_.Message -match "(?i)trivyscan|trivy" })
+    $sacPolicy = @($ciPolicies | Where-Object { $_.FriendlyName -like "VerifiedAndReputableDesktop*" })
+    $orgWdac = @($ciPolicies | Where-Object {
+        $_.FriendlyName -notlike "VerifiedAndReputableDesktop*" -and $_.IsSystemPolicy -eq $false
+    })
+
+    if ($sacPolicy.Count) {
+        $script:Mechanism = "Smart App Control"
+    } elseif ($appLockerDenied -or $appLockerEvents.Count) {
+        $script:Mechanism = "AppLocker"
+    } elseif ($orgWdac.Count) {
+        $script:Mechanism = "WDAC"
+    } else {
+        $script:Mechanism = "none detected"
+    }
+
+    Show-Diagnosis -Paths $Paths -Signatures $signatures -CiPolicies $ciPolicies `
+        -SacState $sacState -AppLocker $appLocker -AppLockerDenied $appLockerDenied `
+        -AppLockerEvents $appLockerEvents -CodeIntegrityEvents $codeIntegrityEvents
+
+    if ($Unblock) {
+        Invoke-Unblock -Paths $exes -Preview $WhatIf
+        if (-not $AppLockerHash -and -not $AppLockerPath -and -not $WdacDraft) {
+            $script:AppControlStatus = "Mark-of-the-Web handled"
+            return
+        }
+    }
+
+    if ($DiagnoseOnlyMode) {
+        $script:AppControlStatus = "diagnosed: $script:Mechanism"
+        return
+    }
+
+    if ($WdacDraft) {
+        if ($sacPolicy.Count) { throw "Refusing to create a supplemental policy for Smart App Control" }
+        New-WdacDraft -Paths $exes -BasePolicyPath $BasePolicyPath -BasePolicyId $BasePolicyId `
+            -SigningCertPath $SigningCertPath -Deploy $Deploy -Preview $WhatIf
+        return
+    }
+
+    if ($AppLockerPath) {
+        New-AppLockerAllow -Paths $exes -RuleType Path -User $User -Preview $WhatIf
+        return
+    }
+    if ($AppLockerHash) {
+        New-AppLockerAllow -Paths $exes -RuleType Hash -User $User -Preview $WhatIf
+        return
+    }
+
+    if ($sacPolicy.Count) {
+        $script:AppControlStatus = "blocked by Smart App Control; signing required"
+        Write-Warn "Smart App Control has no per-app allow list"
+        Write-Warn "Fix: Authenticode-sign both binaries, or turn off Smart App Control manually (one-way)"
+        return
+    }
+
+    if ($appLockerDenied -or $appLockerEvents.Count) {
+        if ($appLocker.Domain) {
+            $script:AppControlStatus = "blocked by AppLocker domain policy"
+            Write-Warn "AppLocker domain policy is blocking; ask IT for a Publisher/Hash rule"
+        } elseif (-not (Test-Admin)) {
+            $script:AppControlStatus = "AppLocker block needs elevation"
+            Write-Warn "AppLocker allow rule needs elevation; re-run this script as Administrator"
+        } else {
+            try {
+                New-AppLockerAllow -Paths $exes -RuleType Hash -User $User -Preview $WhatIf
+            } catch {
+                $script:AppControlStatus = "AppLocker allow failed"
+                Write-Warn "AppLocker allow failed: $($_.Exception.Message)"
+            }
+        }
+        return
+    }
+
+    if ($orgWdac.Count) {
+        $script:AppControlStatus = "blocked by WDAC; draft required"
+        Write-Warn "Organization WDAC is active; use -WdacDraft and have IT sign/deploy the policy"
+        return
+    }
+
+    if ($ForceRun -and (Test-Admin)) {
+        New-AppLockerAllow -Paths $exes -RuleType Hash -User $User -Preview $WhatIf
+    } elseif ($ForceRun) {
+        $script:AppControlStatus = "allow changes need elevation"
+        Write-Warn "AppLocker changes require an elevated PowerShell window"
+    } else {
+        $script:AppControlStatus = "no active block detected"
+        Write-Info "No active Application Control block detected for these binaries"
+    }
+}
+
 function Invoke-DatabaseUpdate {
     param($Paths, [string]$TrivyPath)
     if ($SkipDbUpdate) {
@@ -442,7 +899,7 @@ function Invoke-DatabaseUpdate {
         $script:DbFailed = $true
         $message = $_.Exception.Message
         if ($message -match "Application Control|blocked") {
-            Write-Warn "Windows Application Control blocked trivyscan.exe. Run allow-windows.ps1 -DiagnoseOnly."
+            Write-Warn "Windows Application Control blocked trivyscan.exe. Run install.ps1 -DiagnoseOnly."
         } else {
             Write-Warn "Database update failed: $message"
         }
@@ -536,6 +993,13 @@ function Invoke-Main {
 
     if ($env:OS -ne "Windows_NT") { throw "This installer is for Windows" }
 
+    if ($DiagnoseOnly) {
+        $diagPaths = Get-BinaryPaths -InstallDir $InstallDir
+        Invoke-ApplicationControlAllow -Paths $diagPaths -DiagnoseOnlyMode $true -ForceRun $false -Blocked $false
+        Write-Host "Mechanism: $script:Mechanism"
+        return
+    }
+
     if ($System -and -not (Test-Admin)) {
         if (-not $PSCommandPath) {
             throw "For -System, download install.ps1 to a file and run it with powershell -File ... -System"
@@ -575,6 +1039,9 @@ function Invoke-Main {
     $existingTrivyScan = Get-ExistingTrivyScan -Paths $paths
     if ($existingTrivyScan -and $existingTrivyScan.Path -ne $paths.TrivyScan) {
         throw "Unmanaged TrivyScan found at $($existingTrivyScan.Path); remove it or use -System"
+    }
+    if ($existingTrivyScan -and $existingTrivyScan.Version -eq "BLOCKED") {
+        $script:AppControlBlocked = $true
     }
 
     $localBinary = Get-LocalTrivyScan
@@ -641,6 +1108,9 @@ function Invoke-Main {
     }
 
     $existingTrivy = Get-ExistingTrivy -Paths $paths
+    if ($existingTrivy -and $existingTrivy.Version -eq "BLOCKED") {
+        $script:AppControlBlocked = $true
+    }
     $explicitTrivy = $false
     $desiredTrivy = ""
     if ($TrivyVersion -and $TrivyVersion -ne "latest") {
@@ -712,6 +1182,10 @@ function Invoke-Main {
         -TrivyVersionValue $trivyVersionInstalled -TrivyManaged $trivyManaged `
         -TrivyPath $trivyPath -PathModified $pathModified
 
+    $forceAllow = $AppLockerHash -or $AppLockerPath -or $WdacDraft
+    Invoke-ApplicationControlAllow -Paths $paths -DiagnoseOnlyMode $false `
+        -ForceRun $forceAllow -Blocked $script:AppControlBlocked
+
     Invoke-DatabaseUpdate -Paths $paths -TrivyPath $trivyPath
 
     Write-Host ""
@@ -729,6 +1203,12 @@ function Invoke-Main {
     }
     if ($pathModified) {
         Write-Host "[OK] PATH      -> updated; open a new terminal"
+    }
+    if ($script:AppControlStatus) {
+        Write-Host "[OK] AppControl -> $($script:AppControlStatus)"
+    }
+    if ($script:BackupPath) {
+        Write-Host "[OK] Backup     -> $($script:BackupPath)"
     }
     Write-Host "========================================="
 

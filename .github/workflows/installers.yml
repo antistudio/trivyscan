@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Bash syntax
         run: bash -n scripts/install.sh
-      - name: ShellCheck errors
+      - name: ShellCheck
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
@@ -26,7 +26,7 @@ jobs:
       - name: Parse scripts
         shell: powershell
         run: |
-          $files = @("scripts/install.ps1", "scripts/allow-windows.ps1")
+          $files = @("scripts/install.ps1")
           foreach ($file in $files) {
             $tokens = $null
             $errors = $null
@@ -40,7 +40,7 @@ jobs:
       - name: Parse scripts with PowerShell 7
         shell: pwsh
         run: |
-          $files = @("scripts/install.ps1", "scripts/allow-windows.ps1")
+          $files = @("scripts/install.ps1")
           foreach ($file in $files) {
             $tokens = $null
             $errors = $null
@@ -58,7 +58,7 @@ jobs:
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
           $issues = @()
-          foreach ($file in @("scripts/install.ps1", "scripts/allow-windows.ps1")) {
+          foreach ($file in @("scripts/install.ps1")) {
             $issues += @(Invoke-ScriptAnalyzer -Path $file -Severity Error)
           }
           if ($issues.Count -gt 0) {
@@ -119,17 +119,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & (Join-Path $prefix "trivyscan.exe") --version
           if (-not (Test-Path (Join-Path $prefix "install.json"))) { throw "manifest missing" }
-          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/allow-windows.ps1 `
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tmp "install.ps1") `
             -InstallDir $prefix -DiagnoseOnly -NonInteractive
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tmp "install.ps1") `
             -InstallDir $prefix -Uninstall -NoPath -NonInteractive
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Test-Path (Join-Path $prefix "trivyscan.exe")) { throw "trivyscan still present" }
-
-      - name: Diagnose Application Control
-        shell: powershell
-        run: |
-          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/allow-windows.ps1 `
-            -DiagnoseOnly -NonInteractive
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
